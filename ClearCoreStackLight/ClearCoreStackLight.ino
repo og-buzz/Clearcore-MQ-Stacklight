@@ -227,9 +227,20 @@ void try_mqtt() {
   }
 }
 
+bool link_up() { return EthernetMgr.PhyLinkActive(); }
+
 void network_tick() {
+  static bool reported_link = true;
   if (!mqtt_enabled) return;
   Ethernet.maintain();
+  // DHCP and MQTT connects block while they time out, so only try them with an Ethernet link.
+  if (!link_up()) {
+    if (reported_link) log_line("network: no Ethernet link; waiting for a cable");
+    reported_link = false;
+    return;
+  }
+  if (!reported_link) log_line("network: Ethernet link up");
+  reported_link = true;
   if (!net_up) {
     if ((int32_t)(millis() - next_net_try) >= 0) {
       start_network();
@@ -324,8 +335,8 @@ void setup() {
     mqtt.setServer(cfg.broker, cfg.port);
     mqtt.setCallback(on_message);
     mqtt.setBufferSize(512);
-    start_network();
-    next_net_try = millis() + kNetRetryMs;
+    EthernetMgr.Setup();  // brings up the PHY so the link can be checked; DHCP waits for a link
+    next_net_try = millis();
   }
   log_line("ClearCoreStackLight %s ready; type 'help' on this port for commands", kVersion);
 }
