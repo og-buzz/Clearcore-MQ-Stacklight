@@ -30,16 +30,14 @@ struct Settings {
   bool dhcp;
   uint8_t ip[4], gateway[4], dns[4], subnet[4];
   // Light
-  int8_t pin[kChannels];  // per channel, kNoPin = not wired
-  uint16_t level[kChannels];  // brightness when lit, in tenths of a percent (0..1000); below 1000 the output runs
-                              // as PWM. Alarm is always 1000.
+  int8_t pin[kChannels];  // per channel, kNoPin = not wired. Brightness comes with each command (see Light.h).
   int8_t button;          // kNoPin = no button
-  // Addressable WS2805 strip mirroring the light (see Strip.h)
+  // Addressable WS2805 strip (see Strip.h)
   int8_t strip_port;           // kNoStrip, 0 = COM-0, 1 = COM-1
   uint16_t strip_pixels;       // 1..kStripMaxPixels
-  uint16_t strip_level[3];     // red, green, blue brightness on the strip, tenths of a percent (0..1000)
   uint8_t strip_timing;        // signal timing, 0..kStripTimings-1 (see Strip.h)
   uint8_t strip_order[3];      // colour sent in each of the first three byte positions: 0 red, 1 green, 2 blue
+  char strip_layout[64];       // line, ring, fold or a pixel map (see Strip.h Layout)
   Timing timing;
   bool allow_reset;
 };
@@ -66,13 +64,9 @@ bool topic(const Settings& s, const char* kind, char* out, size_t cap);
 
 const char* pin_name(int8_t pin);
 
-// Brightness levels are percentages with at most one decimal, e.g. "25" or "27.5", kept in tenths (0..1000).
-bool parse_level(const char* text, uint16_t* tenths);
-// "25", "27.5" or "100" for a level in tenths.
-void format_level(uint16_t tenths, char* out, size_t cap);
-
 // Rewrites settings.ini text so each keys[i] is set to values[i]: lines setting that key are replaced (keeping their
-// line ending), keys not in the file are appended, and every other line is copied unchanged. At most 8 keys.
+// line ending), keys not in the file are appended, and every other line is copied unchanged. A null values[i]
+// removes the key's lines instead. At most 8 keys.
 // Returns the new length (out is NUL-terminated), or -1 if it doesn't fit in cap.
 long set_keys(const char* in, size_t len, const char* const keys[], const char* const values[], size_t n, char* out,
               size_t cap);

@@ -80,15 +80,12 @@ void defaults(Settings* s) {
   memset(s, 0, sizeof *s);
   s->port = 1883;
   s->dhcp = true;
-  for (uint8_t c = 0; c < kChannels; c++) {
-    s->pin[c] = kNoPin;  // nothing driven until configured
-    s->level[c] = 1000;
-  }
+  for (uint8_t c = 0; c < kChannels; c++) s->pin[c] = kNoPin;  // nothing driven until configured
   s->button = kNoPin;
   s->strip_port = kNoStrip;  // no strip until configured: a COM port may have other hardware on it
   s->strip_pixels = 0;
-  for (uint8_t c = 0; c < 3; c++) s->strip_level[c] = 1000;
   s->strip_timing = 4;  // verified on BTF's WS2805 strip (see Strip.h)
+  strcpy(s->strip_layout, "line");
   for (uint8_t i = 0; i < 3; i++) s->strip_order[i] = i;  // R G B, as the WS2805 datasheet says
   s->timing = {350, 150, 750, 250};
   s->allow_reset = false;
@@ -155,11 +152,12 @@ bool apply_line(Settings* s, const char* line, char* err, size_t err_cap) {
       return true;
     }
   }
-  const char* const level_keys[kAlarm] = {"red_level", "green_level", "blue_level"};
-  for (uint8_t c = 0; c < kAlarm; c++) {
-    if (!strcmp(key, level_keys[c])) {
-      if (!parse_level(value, &s->level[c])) return fail(err, err_cap, "must be 0..100 (percent, e.g. 27.5)", key), false;
-      return true;
+  const char* const old_level_keys[] = {"red_level",       "green_level",       "blue_level",
+                                        "strip_red_level", "strip_green_level", "strip_blue_level"};
+  for (const char* old : old_level_keys) {
+    if (!strcmp(key, old)) {
+      return fail(err, err_cap, "no longer used: brightness comes with each command, e.g. IO5=26 (remove the line, "
+                                "or 'unset' it on the USB console)", key), false;
     }
   }
   if (!strcmp(key, "strip")) {
@@ -177,6 +175,15 @@ bool apply_line(Settings* s, const char* line, char* err, size_t err_cap) {
     if (!parse_uint(value, kStripMaxPixels, &u) || u == 0) return fail(err, err_cap, "must be 1..300", key), false;
     s->strip_pixels = (uint16_t)u;
     return true;
+  }
+  if (!strcmp(key, "strip_layout")) {
+    static Layout check;  // large: not on the stack
+    char why[80];
+    if (!layout_parse(value, kStripMaxPixels, &check, why, sizeof why)) return fail(err, err_cap, why, key), false;
+    return set_text(s->strip_layout, sizeof s->strip_layout, value, key, err, err_cap);
+  }
+  if (!strcmp(key, "strip_mirror")) {
+    return fail(err, err_cap, "replaced by strip_layout=fold (remove the line, or 'unset' it)", key), false;
   }
   if (!strcmp(key, "strip_order")) {
     uint8_t order[3];
@@ -196,13 +203,6 @@ bool apply_line(Settings* s, const char* line, char* err, size_t err_cap) {
     if (!parse_uint(value, kStripTimings - 1, &u)) return fail(err, err_cap, "must be 0..5", key), false;
     s->strip_timing = (uint8_t)u;
     return true;
-  }
-  const char* const strip_level_keys[3] = {"strip_red_level", "strip_green_level", "strip_blue_level"};
-  for (uint8_t c = 0; c < 3; c++) {
-    if (!strcmp(key, strip_level_keys[c])) {
-      if (!parse_level(value, &s->strip_level[c])) return fail(err, err_cap, "must be 0..100 (percent, e.g. 27.5)", key), false;
-      return true;
-    }
   }
   if (!strcmp(key, "button")) {
     if (!parse_pin(value, false, &s->button)) return fail(err, err_cap, "must be IO0..IO5, DI6..DI8 or none", key), false;
@@ -269,31 +269,6 @@ bool topic(const Settings& s, const char* kind, char* out, size_t cap) {
   return n > 0 && (size_t)n < cap;
 }
 
-bool parse_level(const char* text, uint16_t* tenths) {
-  unsigned whole = 0, frac = 0;
-  const char* p = text;
-  if (!isdigit((unsigned char)*p)) return false;
-  for (; isdigit((unsigned char)*p); p++) {
-    whole = whole * 10 + (unsigned)(*p - '0');
-    if (whole > 100) return false;
-  }
-  if (*p == '.') {
-    p++;
-    if (!isdigit((unsigned char)*p)) return false;
-    frac = (unsigned)(*p++ - '0');
-  }
-  if (*p != '\0') return false;  // more than one decimal, or junk
-  unsigned t = whole * 10 + frac;
-  if (t > 1000) return false;
-  *tenths = (uint16_t)t;
-  return true;
-}
-
-void format_level(uint16_t tenths, char* out, size_t cap) {
-  if (tenths % 10) snprintf(out, cap, "%u.%u", tenths / 10u, tenths % 10u);
-  else snprintf(out, cap, "%u", tenths / 10u);
-}
-
 // Index in keys[] of the key this settings line sets, or -1 for comments, blank lines and other keys.
 static int line_key(const char* line, size_t len, const char* const keys[], size_t n) {
   size_t i = 0;
@@ -340,12 +315,13 @@ long set_keys(const char* in, size_t len, const char* const keys[], const char* 
       continue;
     }
     found[k] = true;
+    if (!values[k]) continue;  // removing this key: drop the line
     if (!put_setting((size_t)k) || !put(in + text_end, i - text_end)) return -1;
   }
   const char* eol = crlf ? "\r\n" : "\n";
   bool need_eol = len > 0 && in[len - 1] != '\n';
   for (size_t k = 0; k < n; k++) {
-    if (found[k]) continue;
+    if (found[k] || !values[k]) continue;
     if (need_eol && !put(eol, strlen(eol))) return -1;
     need_eol = false;
     if (!put_setting(k) || !put(eol, strlen(eol))) return -1;

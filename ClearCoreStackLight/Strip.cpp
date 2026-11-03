@@ -1,6 +1,7 @@
 // Strip.cpp — see Strip.h.
 #include "Strip.h"
 
+#include <stdio.h>
 #include <string.h>
 
 namespace sl {
@@ -44,7 +45,7 @@ size_t strip_reset_bytes(const StripTiming& t) {
 }
 
 size_t strip_frame_bytes(int pixels, const StripTiming& t) {
-  return (size_t)clamp_pixels(pixels) * kStripChannels * t.bits + strip_reset_bytes(t);
+  return kStripLeadBytes + (size_t)clamp_pixels(pixels) * kStripChannels * t.bits + strip_reset_bytes(t);
 }
 
 void strip_pulses(const StripTiming& t, int ns[4]) {
@@ -56,14 +57,150 @@ void strip_pulses(const StripTiming& t, int ns[4]) {
   ns[3] = to_ns(t.bits) - ns[2];
 }
 
-void strip_color(const bool on[kChannels], const uint16_t level[3], const uint8_t order[3],
-                 uint8_t out[kStripChannels]) {
-  const Channel colours[3] = {kRed, kGreen, kBlue};
-  for (int i = 0; i < 3; i++) {
-    int c = order[i] < 3 ? order[i] : i;
-    out[i] = on[colours[c]] ? level_duty(level[c]) : 0;
+namespace {
+
+bool word(const char* a, const char* b) {  // case-insensitive equality
+  for (; *a && *b; a++, b++)
+    if ((*a | 0x20) != (*b | 0x20)) return false;
+  return *a == *b;
+}
+
+bool read_index(const char*& p, int* out) {
+  if (*p < '0' || *p > '9') return false;
+  int v = 0;
+  while (*p >= '0' && *p <= '9' && v < 10000) v = v * 10 + (*p++ - '0');
+  *out = v;
+  return true;
+}
+
+}  // namespace
+
+bool layout_parse(const char* text, int pixels, Layout* L, char* err, size_t cap) {
+  if (pixels < 0) pixels = 0;
+  if (pixels > kStripMaxPixels) pixels = kStripMaxPixels;
+  for (int i = 0; i < kStripMaxPixels; i++) L->pos[i] = -1;
+  L->positions = 0;
+  L->wrap = false;
+  if (!*text || word(text, "line") || word(text, "ring")) {
+    for (int i = 0; i < pixels; i++) L->pos[i] = (int16_t)i;
+    L->positions = pixels;
+    L->wrap = word(text, "ring");
+    return true;
   }
-  out[3] = out[4] = 0;
+  if (word(text, "fold")) {
+    const int half = (pixels + 1) / 2;
+    for (int i = 0; i < pixels; i++) L->pos[i] = (int16_t)(i < half ? i : pixels - 1 - i);
+    L->positions = half;
+    return true;
+  }
+  // A map: legs separated by '|', each a ','-separated list of ranges a-b (either direction) or single pixels.
+  const char* p = text;
+  int position = 0;
+  while (true) {
+    while (*p == ' ') p++;
+    int a, b;
+    if (!read_index(p, &a)) {
+      if (err && cap) snprintf(err, cap, "strip_layout: expected line, ring, fold or ranges like 0-24|49-25");
+      return false;
+    }
+    b = a;
+    if (*p == '-') {
+      p++;
+      if (!read_index(p, &b)) {
+        if (err && cap) snprintf(err, cap, "strip_layout: a range needs two pixel numbers, e.g. 49-25");
+        return false;
+      }
+    }
+    if (a >= pixels || b >= pixels) {
+      if (err && cap) snprintf(err, cap, "strip_layout: pixel %d is past the strip's %d pixels", a > b ? a : b, pixels);
+      return false;
+    }
+    for (int k = a;; k += (b >= a ? 1 : -1)) {
+      if (L->pos[k] >= 0) {
+        if (err && cap) snprintf(err, cap, "strip_layout: pixel %d is in the map twice", k);
+        return false;
+      }
+      L->pos[k] = (int16_t)position++;
+      if (position > L->positions) L->positions = position;
+      if (k == b) break;
+    }
+    while (*p == ' ') p++;
+    if (*p == ',') {
+      p++;
+    } else if (*p == '|') {
+      p++;
+      position = 0;  // the next leg lies beside the first
+    } else if (*p == '\0') {
+      return true;
+    } else {
+      if (err && cap) snprintf(err, cap, "strip_layout: unexpected '%c'", *p);
+      return false;
+    }
+  }
+}
+
+void strip_effects_reset(StripEffects* fx, uint32_t seed) {
+  for (int k = 0; k <= kMaxEffects; k++) effect_reset(&fx->st[k], seed * 2654435761u + (uint32_t)k * 40503u + 1u);
+}
+
+void strip_render(const State& s, const Timing& t, uint32_t now, const Layout& L, const uint8_t order[3],
+                  StripEffects* fx, int pixels, uint8_t* out) {
+  static uint8_t pos_col[kStripMaxPixels][kStripChannels];
+  static uint8_t tmp[kStripMaxPixels][kStripChannels];
+  const int P = L.positions < kStripMaxPixels ? L.positions : kStripMaxPixels;
+  bool lit_now[kChannels];
+  lit(s, t, now, lit_now);
+  for (int p = 0; p < P; p++) {
+    uint8_t* c = pos_col[p];
+    if (!s.strip_set) {  // the colour names, full brightness
+      c[0] = lit_now[kRed] ? 255 : 0;
+      c[1] = lit_now[kGreen] ? 255 : 0;
+      c[2] = lit_now[kBlue] ? 255 : 0;
+      c[3] = c[4] = 0;
+    } else if (!s.pixel_fx[p]) {
+      bool on = blink(s.pixel_mode[p], t, now);
+      for (int ch = 0; ch < kStripChannels; ch++) c[ch] = on ? level_duty(s.pixel[p][ch]) : 0;
+    }
+  }
+  if (!s.strip_set && s.fire) {  // the FIRE name burns the whole strip
+    EffectSpec spec;
+    memset(&spec, 0, sizeof spec);
+    spec.id = kFireFx;
+    spec.speed = 1;
+    spec.level = 1000;
+    spec.last = (int16_t)(P - 1);
+    effect_render(spec, &fx->st[kMaxEffects], P, L.wrap, now, pos_col);
+  } else if (s.strip_set) {
+    for (int k = 0; k < s.fx_count; k++) {
+      const EffectSpec& e = s.fx[k];
+      const int first = e.first, last = e.last < P - 1 ? e.last : P - 1;
+      if (first > last) continue;
+      effect_render(e, &fx->st[k], last - first + 1, L.wrap && first == 0 && last == P - 1, now, tmp);
+      for (int p = first; p <= last; p++)
+        if (s.pixel_fx[p] == k + 1) memcpy(pos_col[p], tmp[p - first], kStripChannels);
+    }
+  }
+  if (pixels > kStripMaxPixels) pixels = kStripMaxPixels;
+  for (int i = 0; i < pixels; i++) {
+    uint8_t* o = out + (size_t)i * kStripChannels;
+    const int p = L.pos[i];
+    if (p < 0 || p >= P) {
+      memset(o, 0, kStripChannels);
+      continue;
+    }
+    const uint8_t* c = pos_col[p];
+    for (int k = 0; k < 3; k++) o[k] = c[order[k] < 3 ? order[k] : k];
+    o[3] = c[3];
+    o[4] = c[4];
+  }
+}
+
+void strip_encode(const uint8_t* pixel_bytes, int pixels, const StripTiming& t, uint8_t* out) {
+  pixels = clamp_pixels(pixels);
+  memset(out, 0, kStripLeadBytes);  // lead-in: line low
+  out += kStripLeadBytes;
+  for (int b = 0; b < pixels * kStripChannels; b++) encode_byte(pixel_bytes[b], t, out + (size_t)b * t.bits);
+  memset(out + (size_t)pixels * kStripChannels * t.bits, 0, strip_reset_bytes(t));  // reset: line low
 }
 
 void strip_encode_solid(const uint8_t color[kStripChannels], int pixels, const StripTiming& t, uint8_t* out) {
@@ -71,6 +208,8 @@ void strip_encode_solid(const uint8_t color[kStripChannels], int pixels, const S
   const size_t per_pixel = (size_t)kStripChannels * t.bits;
   uint8_t pixel[kStripChannels * kStripMaxBits];
   for (int c = 0; c < kStripChannels; c++) encode_byte(color[c], t, pixel + c * t.bits);
+  memset(out, 0, kStripLeadBytes);  // lead-in: line low
+  out += kStripLeadBytes;
   for (int p = 0; p < pixels; p++) memcpy(out + (size_t)p * per_pixel, pixel, per_pixel);
   memset(out + (size_t)pixels * per_pixel, 0, strip_reset_bytes(t));  // reset: line low
 }
@@ -78,12 +217,15 @@ void strip_encode_solid(const uint8_t color[kStripChannels], int pixels, const S
 size_t strip_encode_raw(const uint8_t* bytes, int n, int pixels, const StripTiming& t, uint8_t* out, size_t cap) {
   if (n < 1 || n > 8) return 0;
   pixels = clamp_pixels(pixels);
-  const size_t per_pixel = (size_t)n * t.bits, len = (size_t)pixels * per_pixel + strip_reset_bytes(t);
+  const size_t per_pixel = (size_t)n * t.bits;
+  const size_t len = kStripLeadBytes + (size_t)pixels * per_pixel + strip_reset_bytes(t);
   if (len > cap) return 0;
   uint8_t pixel[8 * kStripMaxBits];
   for (int c = 0; c < n; c++) encode_byte(bytes[c], t, pixel + c * t.bits);
-  for (int p = 0; p < pixels; p++) memcpy(out + (size_t)p * per_pixel, pixel, per_pixel);
-  memset(out + (size_t)pixels * per_pixel, 0, strip_reset_bytes(t));
+  memset(out, 0, kStripLeadBytes);
+  uint8_t* data = out + kStripLeadBytes;
+  for (int p = 0; p < pixels; p++) memcpy(data + (size_t)p * per_pixel, pixel, per_pixel);
+  memset(data + (size_t)pixels * per_pixel, 0, strip_reset_bytes(t));
   return len;
 }
 

@@ -39,14 +39,13 @@ Copy [`settings.example.ini`](settings.example.ini) to the root of the microSD c
 | `asset` | The unit's asset tag (e.g. `cc-0001`); used as the MQTT client ID |
 | `ip` | `dhcp` (default) or a static address, with `gateway`, `dns` and `subnet` |
 | `red`, `green`, `blue`, `alarm` | Output for each channel: `IO0`..`IO5` or `none` |
-| `red_level`, `green_level`, `blue_level` | Brightness of each colour when lit, `0`..`100` % with up to one decimal, e.g. `27.5` (default `100`). Below 100 the output runs as PWM, so a bright colour can be turned down to balance mixes like yellow |
 | `button` | Input for a push button: `IO0`..`IO5`, `DI6`..`DI8` or `none` |
 | `fast_on`, `fast_off`, `slow_on`, `slow_off` | Blink timing in milliseconds |
 | `allow_reset` | `true` to allow a reboot over MQTT (default `false`) |
-| `strip`, `strip_pixels` | A WS2805 strip on `COM0` or `COM1` with this many pixels (default `none`); it mirrors the light |
-| `strip_red_level`, `strip_green_level`, `strip_blue_level` | Brightness of each colour on the strip, `0`..`100` % (default `100`) |
+| `strip`, `strip_pixels` | A WS2805 strip on `COM0` or `COM1` with this many pixels (default `none`) |
 | `strip_order` | Colour order on the wire: `RGB` (default, WS2805 datasheet), `GRB` (BTF's WS2805 strip), or any other order of R, G and B |
 | `strip_timing` | Signal timing `0`..`5` (default `4`, see below) |
+| `strip_layout` | How the strip is laid out; pixel numbers in commands are positions along it: `line` (default), `ring` (moving effects go round), `fold` (folded at its middle and run back, both legs side by side), or a map of pixel ranges in position order, `|` starting a leg beside the first: `0-24|49-25` is `fold` for 50 pixels, `24-0,25-49` runs centre-out, `0-16|33-17|34-49` is three legs |
 
 Problems in the file (unknown keys, bad values, two channels on one pin) are printed on the USB serial port at boot. A bad line is ignored; two channels on one pin disables all outputs.
 
@@ -63,33 +62,106 @@ A retained `RESET` would reboot the board on every reconnect, so the light ignor
 
 ## Light commands
 
-A command is one or more `NAME[,MODE]` pairs separated by `;`, applied to a light that starts all off.
+A command describes the whole light, starting from all off: items separated by `;`. Brightness comes with the
+command, so the publisher decides the colours.
 
-- Names: `RED`, `GREEN`, `BLUE`, `YELLOW` and `ORANGE` (both red + green), `MAGENTA`, `CYAN`, `WHITE` and `ALL` (red + green + blue), `ALARM` (the buzzer channel), `FIRE` (alternates red and yellow with the alarm fast), `OFF`
-- Modes: `ON` (default), `OFF`, `SLOW`, `FAST`
-- Case doesn't matter. An invalid command is rejected and the light keeps its state.
+| Item | Does |
+|---|---|
+| `NAME[,MODE]` | `RED`, `GREEN`, `BLUE`, `YELLOW` and `ORANGE` (red + green), `MAGENTA`, `CYAN`, `WHITE` and `ALL` (red + green + blue), `ALARM`, `FIRE` (red and yellow alternating, alarm fast), `OFF` (clears everything). Lights the pins `settings.ini` names for those channels at full brightness, and the whole strip unless a `STRIP` item is given |
+| `IOn=PERCENT[,MODE]` | Light output `IO0`..`IO5` at `0`..`100` % (one decimal), e.g. `IO5=26`. Overrides the names for that pin; only pins named in `settings.ini` (`red=`, `green=`, `blue=`, `alarm=`) are accepted |
+| `STRIP=R,G,B[,WW,CW][,MODE]` | Every pixel: red, green, blue, warm white, cool white in percent |
+| `STRIP[n]=…`, `STRIP[a-b]=…` | Pixel `n`, or pixels `a`..`b` (0 = the end at the ClearCore). With any `STRIP` item the strip starts dark and the items paint it in order |
+| `STRIP=EFFECT[,options]`, `STRIP[a-b]=EFFECT…` | An effect over the range (see [Strip effects](#strip-effects)). Options, in any order: a speed `SLOW`, `ON` (normal) or `FAST`; up to two colours, names (`RED`, `ORANGE`, `AMBER`, `YELLOW`, `GREEN`, `CYAN`, `BLUE`, `PURPLE`, `MAGENTA`, `PINK`, `WARM`, `COOL`, `WHITE`) or percents `r/g/b[/ww/cw]`; a dimmer, a plain percent (`40`); a colour temperature for the white lights (`4000K`); a rate for the flashers and the strobe (`25HZ`). Up to 8 effects in one command. Without `STRIP` items, the `FIRE` name burns the whole strip |
+
+Modes: `ON` (default), `OFF`, `SLOW`, `FAST`; everything in the same mode blinks in step. Case doesn't matter.
+An invalid command is rejected (reported on the event topic) and the light keeps its state.
 
 ```bash
-mosquitto_pub -h <broker> -t stacklight/acme/main-plant/cc-01/command -r -m 'GREEN'
-mosquitto_pub -h <broker> -t stacklight/acme/main-plant/cc-01/command -r -m 'YELLOW,SLOW;ALARM,FAST'
-mosquitto_pub -h <broker> -t stacklight/acme/main-plant/cc-01/command -r -m 'OFF'
+T=stacklight/acme/main-plant/cc-01/command
+mosquitto_pub -h <broker> -t $T -r -m 'GREEN'
+mosquitto_pub -h <broker> -t $T -r -m 'YELLOW,SLOW;ALARM,FAST'
+mosquitto_pub -h <broker> -t $T -r -m 'IO4=100;IO5=26;STRIP=100,40,0'          # balanced yellow
+mosquitto_pub -h <broker> -t $T -r -m 'STRIP=0,0,0,0,30;STRIP[0-9]=100,0,0,0,0,FAST'
+mosquitto_pub -h <broker> -t $T -r -m 'STRIP=FIRE,FAST'
+mosquitto_pub -h <broker> -t $T -r -m 'OFF'
 ```
 
 The 2024 payloads such as `RED,ON` and `ALL,OFF` still work, with one change: each command now sets the whole light, so `GREEN,ON` turns red off.
 
+## Strip effects
+
+| Group | Effect | Look | Colours (defaults) |
+|---|---|---|---|
+| Fire and earth | `FIRE` | Flames from the start of the range: ember red, orange, amber, yellow, white-hot with both whites, hues drifting | – |
+| | `CANDLE` | Soft warm-white flicker, each position on its own | – |
+| | `LAVA` | Slow molten blobs of red and orange | – |
+| | `SUNRISE` | Night, dawn red, orange, warm white, daylight and back, 60 s a cycle (SLOW 120, FAST 30), brightest at the start | – |
+| Water and sky | `WATER` | Rolling blue and cyan waves with white caps and glints | – |
+| | `RAIN` | Drops running from the far end with short trails | light blue |
+| | `ICE` | Cool white and cyan shimmer with glints | – |
+| | `AURORA` | Green, teal and violet curtains waving slowly | – |
+| | `LIGHTNING` | Dark storm, bursts of white flashes over part of the range | – |
+| Space | `SPACE` | Deep blue night, twinkling stars, a shooting star now and then | – |
+| | `NEBULA` | Slow purple, magenta and blue clouds with faint stars | – |
+| | `METEOR` | Meteors with trails that break up as they fade | blue-white |
+| Lasers and party | `LASER` | One fast beam bouncing end to end, hot core and glow | red |
+| | `LASERS` | Three beams crossing at different speeds | red, green (+ blue) |
+| | `SCANNER` | A bouncing eye | red |
+| | `DISCO` | Blocks of random colours on the beat (120 bpm), mirror-ball sparkles | – |
+| | `STROBE` | White flashes, 10 Hz (SLOW 4, FAST 20, or any rate up to 60 with `NNHZ`), 30 ms each, shorter above 13 Hz | white |
+| | `CONFETTI` | Random coloured sparks fading out | – |
+| Colour motion | `RAINBOW` | A rainbow scrolling along the range | – |
+| | `PLASMA` | Psychedelic interference colours | – |
+| | `COMET` | A comet with a fading tail, again and again (on a ring, round) | cyan-white |
+| | `THEATER` | Marching marquee lights | amber, off |
+| | `WIPE` | Fill from the start, hold, empty, hold | blue, off |
+| | `MATRIX` | Green code rain with white-hot heads | green |
+| Calm | `BREATHE` | A slow fade in and out, 4 s | soft blue |
+| | `HEARTBEAT` | Lub-dub double pulse | red |
+| | `TWINKLE` | Soft twinkles on a dim background | warm white, dim warm |
+| | `FIREPLACE` | `FIRE`, calm: slow low embers at half brightness over a warm glow, never white-hot | – |
+| | `LAKE` | `WATER`, calm: a slow swell, deeper and dimmer, the odd glint | – |
+| Warning lights | `POLICE` | Sides alternating, a double flash each: 120 flashes a minute per side (SLOW 60, FAST 240) | red, blue |
+| | `WIGWAG` | Sides alternating, one flash each: 75 a minute per side (SLOW 60, FAST 120) | red, blue |
+| | `QUAD` | Sides alternating, four quick flashes each, 60 cycles a minute (SLOW 30, FAST 120) | red, blue |
+| | `BEACON` | One flash for the range: 55 a minute (SLOW 50, FAST 60), lit 60 % of each cycle | amber |
+| | `HAZARD` | Sides alternating, two quick flashes each, 75 sequences a minute | amber, amber |
+| White light | `LIGHT` | Steady white, 4000 K, from the strip's 3000 K and 6500 K LEDs (below 3000 K, down to 2200 K, some red warms it); `LIGHT,2700K,30` | – |
+| | `DAYLIGHT`, `NEUTRAL`, `WARMLIGHT` | `LIGHT` at 6500, 4500 and 3000 K | – |
+
+```bash
+mosquitto_pub -h <broker> -t $T -r -m 'STRIP=AURORA,SLOW'
+mosquitto_pub -h <broker> -t $T -r -m 'STRIP[0-12]=WATER;STRIP[13-24]=FIRE'
+mosquitto_pub -h <broker> -t $T -r -m 'STRIP=WARMLIGHT,20;STRIP[24-25]=LASER,FAST,GREEN'
+mosquitto_pub -h <broker> -t $T -r -m 'STRIP=LIGHT,4000K,60'                       # desk light, dimmed
+mosquitto_pub -h <broker> -t $T -r -m 'STRIP=QUAD,RED,WHITE'                       # fire-engine colours
+```
+
+The flash rates follow published guidance where there is some: `BEACON` keeps to the MUTCD's flashing beacon
+rule (50-60 flashes a minute, lit for 1/2 to 2/3 of each cycle), `HAZARD` uses the MUTCD's 75 sequences a
+minute for rapid-flashing beacons (the pattern itself is simplified), and `POLICE`, `WIGWAG` and `QUAD` stay
+within 60-240 flashes a minute, the range commonly cited for SAE J595 warning lamps. None of this makes the
+strip a certified warning device. Flashing between about 3 and 30 Hz (`STROBE`, fast flashers) can trigger
+seizures in people with photosensitive epilepsy.
+
+For laying out a new installation, `strip_index` on the USB console lights the physical pixels in wiring order in blocks of 5 (red, orange, yellow, green, cyan, blue, purple, pink, warm white, cool white), each block fading 100, 32, 10, 3, 1 %, so every pixel can be named ("the 2nd green"). `strip_index off` ends it.
+
 ## Addressable strip
 
-A WS2805 RGBCCT strip on COM-0 or COM-1 shows the same colours and blinking as the light, every pixel alike
-(the whites stay off for now). The ClearCore has no fast logic-level output, so the WS2805 signal is made
+A WS2805 RGBCCT strip on COM-0 or COM-1 shows the `STRIP` items of each command, or, without them, the colour
+names on every pixel. The ClearCore has no fast logic-level output, so the WS2805 signal is made
 on the COM port's SPI data line by DMA. With the default timing 4, every data bit is 13 SPI bits at 12 MHz:
 `0` = 333 ns high / 750 ns low, `1` = 750 / 333 ns (NeoPixelBus/WLED use 300/790 and 790/300 ns for the
 WS2805), then a 300 µs reset. 12 MHz needs the port's SPI clocked from the ClearCore's 48 MHz generator
 instead of the library's 10 MHz one; the sketch does that. It also turns off the port's hardware slave
 select, which the ClearCore library enables for SPI and which pauses about three clock periods after every
-byte: enough to stretch pulses at every byte boundary and make the strip misread its data.
+byte: enough to stretch pulses at every byte boundary and make the strip misread its data. Each frame also
+starts with a few bytes of low line: the first bit an SPI transfer puts out can come out clipped, and the
+strip then loses it and shifts every pixel by one bit.
 
-Each pixel is five bytes: three colours, then the two whites (off for now). The colour order varies by
-strip; BTF's WS2805 strip wants `strip_order=GRB`.
+Each pixel is five bytes: three colours, then warm white and cool white. The colour order varies by strip;
+BTF's WS2805 strip wants `strip_order=GRB`. A frame of 50 pixels takes 2.5 ms, so the strip can change up to
+about 400 times a second.
 
 | RJ-45 pin (COM port) | Strip |
 |---|---|
@@ -102,9 +174,9 @@ the strip point away from the connection.
 
 ## USB serial console
 
-At 115200 baud the USB port takes the same light commands, plus `status` (settings, network, MQTT and light state; never the password), `level`, `save`, `set`, `reboot` and `help`. `level green 40` sets a colour's brightness until the next reboot, for finding the right `*_level` values by eye; `save` then writes the current levels into `settings.ini` (keeping the rest of the file, with the previous version in `settings.bak`). The strip's levels are `strip_red`, `strip_green` and `strip_blue`. `set <key> <value>` checks any setting and writes it into `settings.ini` the same way, e.g. `set strip COM0`; `reboot` applies it.
+At 115200 baud the USB port takes the same light commands, plus `status` (settings, network, MQTT and light state; never the password), `set`, `unset`, `reboot` and `help`. `set <key> <value>` checks a setting the way `settings.ini` is read and writes it into the file, keeping every other line (the previous version goes to `settings.bak`), e.g. `set strip COM0`; `unset <key>` removes a key's lines; `reboot` applies them.
 
-For bringing up a new strip: `strip_timing [n]` lists or switches the signal timing until a reboot; `strip_raw <hex>` sends the same raw bytes to every pixel (e.g. `strip_raw 000000ff00` lights only the first white) until the light changes; `strip_loopback`, with a wire from the COM port's pin 5 to pin 3, reads the data line back and times a frame to check the bytes go out without pauses. That makes it possible to test the wiring before the network is set up.
+For bringing up a new strip: `strip_index` (above); `strip_timing [n]` lists or switches the signal timing until a reboot; `strip_raw <hex>` sends the same raw bytes to every pixel (e.g. `strip_raw 000000ff00` lights only the first white) until the light changes; `strip_loopback`, with a wire from the COM port's pin 5 to pin 3, reads the data line back and times a frame to check the bytes go out without pauses. That makes it possible to test the wiring before the network is set up.
 
 ## Tests
 

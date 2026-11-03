@@ -11,12 +11,12 @@
 //   .../event    "applied <state>", "rejected <reason>", "button"
 //   .../reset    subscribed only with allow_reset=true; "RESET" reboots the board
 //
-// An addressable WS2805 strip on COM-0 or COM-1 (strip= and strip_pixels= in settings.ini) shows the same
-// colours and blinking as the light, every pixel alike (see Strip.h).
+// Commands carry the brightness: colour names light their pins at full brightness, IOn=PERCENT sets one light
+// output (PWM), and STRIP items set the pixels of an addressable WS2805 strip on COM-0 or COM-1 (strip= and
+// strip_pixels= in settings.ini); without STRIP items the strip shows the colour names (see Light.h, Strip.h).
 //
-// The USB serial port (115200 baud) takes the same commands, plus "status", "level", "save", "set",
-// "reboot" and "help".
-// Colour channels with a level below 100 % (red_level etc. in settings.ini) run as PWM outputs.
+// The USB serial port (115200 baud) takes the same commands, plus "status", "set", "unset", "reboot", "help"
+// and the strip tests "strip_timing", "strip_raw" and "strip_loopback".
 //
 // FQBN: ClearCore:sam:clearcore. Needs the PubSubClient library (arduino-cli lib install PubSubClient).
 
@@ -33,9 +33,9 @@
 
 namespace {
 
-const char* const kVersion = "2.2.0";
+const char* const kVersion = "2.3.0";
 const char* const kSettingsFile = "settings.ini";
-const char* const kBackupFile = "settings.bak";  // the previous settings.ini, written by "save"
+const char* const kBackupFile = "settings.bak";  // the previous settings.ini, written by "set" and "unset"
 const uint32_t kNetRetryMs = 10000;
 const uint32_t kMqttBackoffMinMs = 2000, kMqttBackoffMaxMs = 60000;
 const uint32_t kStaleResetWindowMs = 3000;  // retained reset messages arrive right after subscribing
@@ -45,24 +45,40 @@ const int kArduinoPin[sl::kPinCount] = {IO0, IO1, IO2, IO3, IO4, IO5, DI6, DI7, 
 // Light outputs by pin (IO0..IO5), driven through the ClearCore API so they can run as PWM.
 DigitalInOut* const kOutput[6] = {&ConnectorIO0, &ConnectorIO1, &ConnectorIO2,
                                   &ConnectorIO3, &ConnectorIO4, &ConnectorIO5};
-const char* const kChannelNames[sl::kChannels] = {"red", "green", "blue", "alarm"};
-
 sl::Settings cfg;
 sl::State light;
-int16_t written[sl::kChannels];  // last duty (PWM) or state (digital) written per channel; -1 = not configured
+int16_t written[sl::kIoPins];  // last PWM duty written per IO pin; -1 = not a light output
+
+// Light outputs are the IO pins settings.ini names for red, green, blue and alarm.
+bool is_light_output(int pin) {
+  for (uint8_t c = 0; c < sl::kChannels; c++)
+    if (cfg.pin[c] == pin) return true;
+  return false;
+}
 
 // Strip: one DMA buffer, refilled only while the previous frame isn't on the wire.
 const uint32_t kStripRefreshMs = 1000;  // resend the frame this often even when nothing changed
 SerialDriver* strip_com = nullptr;       // set when a strip is configured
 DmaChannels strip_dma;
 uint8_t strip_buf[sl::kStripMaxFrameBytes] __attribute__((aligned(4)));
-uint8_t strip_shown[sl::kStripChannels];
+sl::Layout strip_map;                                          // pixel -> position (strip_layout)
+sl::StripEffects strip_fx;                                     // the running effects' state
+uint8_t strip_pix[sl::kStripMaxPixels * sl::kStripChannels];   // this loop's pixel bytes, wire order
+uint8_t strip_last[sl::kStripMaxPixels * sl::kStripChannels];  // the frame last sent
 bool strip_sent_once = false;
 uint32_t strip_last_send = 0, strip_frames = 0;
 // "strip_raw" test pattern: sent instead of the light's colour until the light changes or "strip_raw" alone.
 uint8_t strip_raw_bytes[8];
 int strip_raw_len = 0;
 bool strip_raw_sent = false;
+// "strip_index": every physical pixel in wiring order, blocks of 5 in rainbow order, each block fading from
+// 100 % to 1 % (100, 32, 10, 3, 1), for working out how the strip is laid out. Stays on (through light changes) until "strip_index off".
+bool strip_index_on = false;
+const uint8_t kIndexColors[10][sl::kStripChannels] = {
+    {255, 0, 0, 0, 0},   {255, 45, 0, 0, 0},  {255, 120, 0, 0, 0}, {0, 255, 0, 0, 0}, {0, 170, 255, 0, 0},
+    {0, 0, 255, 0, 0},   {130, 0, 255, 0, 0}, {255, 0, 110, 0, 0}, {0, 0, 0, 255, 0}, {0, 0, 0, 0, 255}};
+const char* const kIndexNames[10] = {"red",  "orange", "yellow", "green",      "cyan",
+                                     "blue", "purple", "pink",   "warm white", "cool white"};
 // Starts sending len bytes of strip_buf.
 void strip_send(size_t len) {
   if (!strip_com->SpiTransferDataAsync(strip_buf, nullptr, (int32_t)len)) {
@@ -83,7 +99,7 @@ bool net_up = false;
 uint32_t next_net_try = 0, next_mqtt_try = 0, mqtt_backoff = kMqttBackoffMinMs, subscribed_at = 0;
 
 void log_line(const char* fmt, ...) {
-  char buf[200];
+  static char buf[640];
   va_list args;
   va_start(args, fmt);
   vsnprintf(buf, sizeof buf, fmt, args);
@@ -154,38 +170,19 @@ void load_settings() {
 
 // --- light -----------------------------------------------------------------------------------
 
-bool uses_pwm(uint8_t c) { return c != sl::kAlarm && cfg.level[c] < 1000; }
-
-void print_levels() {
-  char r[8], g[8], b[8];
-  sl::format_level(cfg.level[sl::kRed], r, sizeof r);
-  sl::format_level(cfg.level[sl::kGreen], g, sizeof g);
-  sl::format_level(cfg.level[sl::kBlue], b, sizeof b);
-  log_line("levels: red %s%%, green %s%%, blue %s%%", r, g, b);
-  if (!strip_com) return;
-  sl::format_level(cfg.strip_level[0], r, sizeof r);
-  sl::format_level(cfg.strip_level[1], g, sizeof g);
-  sl::format_level(cfg.strip_level[2], b, sizeof b);
-  log_line("strip levels: strip_red %s%%, strip_green %s%%, strip_blue %s%%", r, g, b);
-}
-
-// Puts a channel's output in PWM or digital mode to match its level, switched off.
-void configure_output(uint8_t c) {
-  written[c] = -1;
-  if (cfg.pin[c] == sl::kNoPin) return;
-  DigitalInOut* out = kOutput[cfg.pin[c]];
-  if (uses_pwm(c)) {
-    out->Mode(Connector::OUTPUT_PWM);
-    out->PwmDuty(0);
-  } else {
-    out->Mode(Connector::OUTPUT_DIGITAL);
-    out->State(false);
+// Puts every light output in PWM mode, switched off. Brightness comes with each command.
+void configure_outputs() {
+  for (int p = 0; p < sl::kIoPins; p++) {
+    written[p] = -1;
+    if (!is_light_output(p)) continue;
+    kOutput[p]->Mode(Connector::OUTPUT_PWM);
+    kOutput[p]->PwmDuty(0);
+    written[p] = 0;
   }
-  written[c] = 0;
 }
 
 void setup_pins() {
-  for (uint8_t c = 0; c < sl::kChannels; c++) configure_output(c);
+  configure_outputs();
   if (cfg.button != sl::kNoPin) pinMode(kArduinoPin[cfg.button], INPUT);
 }
 
@@ -223,6 +220,13 @@ void setup_strip() {
   if (sl::strip_timing(cfg.strip_timing).fast_clock) strip_clock(sl::strip_timing(cfg.strip_timing));
   strip_no_hw_ss();
   size_t reset = sl::strip_reset_bytes(sl::strip_timing(cfg.strip_timing));
+  sl::strip_effects_reset(&strip_fx, micros());
+  char why[96];
+  if (!sl::layout_parse(cfg.strip_layout, cfg.strip_pixels, &strip_map, why, sizeof why)) {
+    log_line("settings: %s; using a straight line", why);
+    settings_errors++;
+    sl::layout_parse("line", cfg.strip_pixels, &strip_map, why, sizeof why);
+  }
   memset(strip_buf, 0, reset);
   strip_com->SpiTransferData(strip_buf, nullptr, (int32_t)reset);  // start from a reset (line low)
 }
@@ -254,8 +258,8 @@ void strip_clock(const sl::StripTiming& t) {
   strip_no_hw_ss();
 }
 
-// Sends the light's current colour to every pixel when it changes, and once a second regardless.
-void strip_tick(const bool on[sl::kChannels]) {
+// Renders every pixel for this moment and sends the frame when anything changed, and once a second regardless.
+void strip_tick() {
   if (!strip_com) return;
   if (strip_raw_len) {  // a test pattern from "strip_raw" is showing
     if (strip_raw_sent && millis() - strip_last_send < kStripRefreshMs) return;
@@ -266,29 +270,40 @@ void strip_tick(const bool on[sl::kChannels]) {
     strip_raw_sent = true;
     return;
   }
-  uint8_t color[sl::kStripChannels];
-  sl::strip_color(on, cfg.strip_level, cfg.strip_order, color);
-  bool changed = !strip_sent_once || memcmp(color, strip_shown, sizeof color) != 0;
-  if (!changed && millis() - strip_last_send < kStripRefreshMs) return;
+  const uint32_t now = millis();
+  const int n = cfg.strip_pixels;
+  const size_t bytes = (size_t)n * sl::kStripChannels;
+  if (strip_index_on) {
+    for (int i = 0; i < n; i++) {
+      const uint8_t* c = kIndexColors[(i / 5) % 10];
+      static const uint16_t kStep[5] = {255, 81, 26, 8, 3};  // 100, 32, 10, 3, 1 %: even steps to the eye
+      const uint16_t k = kStep[i % 5];
+      uint8_t* o = strip_pix + i * sl::kStripChannels;
+      for (int j = 0; j < 3; j++) o[j] = (uint8_t)(c[cfg.strip_order[j]] * k / 255);
+      o[3] = (uint8_t)(c[3] * k / 255);
+      o[4] = (uint8_t)(c[4] * k / 255);
+    }
+  } else {
+    sl::strip_render(light, cfg.timing, now, strip_map, cfg.strip_order, &strip_fx, n, strip_pix);
+  }
+  bool changed = !strip_sent_once || memcmp(strip_pix, strip_last, bytes) != 0;
+  if (!changed && now - strip_last_send < kStripRefreshMs) return;
   if (strip_busy()) return;  // the previous frame is still going out; try again next loop
   const sl::StripTiming& t = sl::strip_timing(cfg.strip_timing);
-  sl::strip_encode_solid(color, cfg.strip_pixels, t, strip_buf);
-  strip_send(sl::strip_frame_bytes(cfg.strip_pixels, t));
-  memcpy(strip_shown, color, sizeof color);
+  sl::strip_encode(strip_pix, n, t, strip_buf);
+  strip_send(sl::strip_frame_bytes(n, t));
+  memcpy(strip_last, strip_pix, bytes);
   strip_sent_once = true;
 }
 
 void update_light() {
-  bool on[sl::kChannels];
-  sl::lit(light, cfg.timing, millis(), on);
-  strip_tick(on);
-  for (uint8_t c = 0; c < sl::kChannels; c++) {
-    if (written[c] < 0) continue;
-    int16_t v = !on[c] ? 0 : uses_pwm(c) ? sl::level_duty(cfg.level[c]) : 1;
-    if (v == written[c]) continue;  // only touch the hardware on a change
-    written[c] = v;
-    if (uses_pwm(c)) kOutput[cfg.pin[c]]->PwmDuty((uint8_t)v);
-    else kOutput[cfg.pin[c]]->State(v != 0);
+  strip_tick();
+  uint8_t duty[sl::kIoPins];
+  sl::io_duty(light, cfg.timing, millis(), cfg.pin, duty);
+  for (int p = 0; p < sl::kIoPins; p++) {
+    if (written[p] < 0 || duty[p] == written[p]) continue;  // only touch the hardware on a change
+    written[p] = duty[p];
+    kOutput[p]->PwmDuty(duty[p]);
   }
 }
 
@@ -298,16 +313,26 @@ void publish_event(const char* text) {
 
 // Applies a command from MQTT or the console. Returns false if it was rejected.
 bool apply_command(const char* text, size_t len, const char* source) {
-  char err[64], desc[64], msg[128];
-  sl::State next;
-  if (!sl::parse_command(text, len, &next, err, sizeof err)) {
+  static sl::State next;  // large: not on the stack
+  static char desc[480], msg[520];
+  char err[96];
+  bool ok = sl::parse_command(text, len, &next, err, sizeof err);
+  for (int p = 0; ok && p < sl::kIoPins; p++) {
+    if (next.io_set[p] && !is_light_output(p)) {
+      snprintf(err, sizeof err, "IO%d is not a light output (name it in %s: red=, green=, blue= or alarm=)", p,
+               kSettingsFile);
+      ok = false;
+    }
+  }
+  if (!ok) {
     log_line("%s: rejected (%s)", source, err);
     snprintf(msg, sizeof msg, "rejected %s", err);
     publish_event(msg);
     return false;
   }
   light = next;
-  strip_raw_len = 0;  // a new light state ends any strip test pattern
+  strip_raw_len = 0;  // a new light state ends a strip_raw test pattern (strip_index stays until "strip_index off")
+  sl::strip_effects_reset(&strip_fx, micros());  // effects start fresh
   sl::describe(light, desc, sizeof desc);
   log_line("%s: %s", source, desc);
   snprintf(msg, sizeof msg, "applied %s", desc);
@@ -334,7 +359,7 @@ void start_network() {
 }
 
 void on_message(char* topic, byte* payload, unsigned int length) {
-  char text[256];
+  static char text[1024];
   if (length >= sizeof text) {
     log_line("mqtt: message on %s too long (%u bytes); ignored", topic, length);
     return;
@@ -434,7 +459,7 @@ void button_tick() {
 // --- USB console -----------------------------------------------------------------------------
 
 void print_status() {
-  char desc[64];
+  static char desc[480];
   sl::describe(light, desc, sizeof desc);
   log_line("ClearCoreStackLight %s", kVersion);
   log_line("settings: %s, %d error(s)", settings_loaded ? "loaded" : "not loaded", settings_errors);
@@ -443,12 +468,12 @@ void print_status() {
   log_line("pins: red %s, green %s, blue %s, alarm %s, button %s", sl::pin_name(cfg.pin[sl::kRed]),
            sl::pin_name(cfg.pin[sl::kGreen]), sl::pin_name(cfg.pin[sl::kBlue]), sl::pin_name(cfg.pin[sl::kAlarm]),
            sl::pin_name(cfg.button));
-  print_levels();
   if (strip_com) {
     const char rgb[] = "RGB";
-    log_line("strip: COM%d, %u WS2805 pixels, order %c%c%c, timing %u, sending %02x %02x %02x, %lu frames sent",
-             cfg.strip_port, cfg.strip_pixels, rgb[cfg.strip_order[0]], rgb[cfg.strip_order[1]],
-             rgb[cfg.strip_order[2]], cfg.strip_timing, strip_shown[0], strip_shown[1], strip_shown[2],
+    log_line("strip: COM%d, %u WS2805 pixels, layout %s (%d positions), order %c%c%c, timing %u, pixel 0 %02x %02x %02x, "
+             "%lu frames sent",
+             cfg.strip_port, cfg.strip_pixels, cfg.strip_layout, strip_map.positions, rgb[cfg.strip_order[0]], rgb[cfg.strip_order[1]],
+             rgb[cfg.strip_order[2]], cfg.strip_timing, strip_last[0], strip_last[1], strip_last[2],
              (unsigned long)strip_frames);
   } else {
     log_line("strip: none");
@@ -464,37 +489,6 @@ void print_status() {
     log_line("mqtt: disabled");
   }
   log_line("light: %s", desc);
-}
-
-// "level" prints the levels. "level <channel> <0..100>" (one decimal allowed, e.g. 27.5) changes one until the
-// next reboot, or until "save". Channels: red, green, blue (the light) and strip_red, strip_green, strip_blue.
-void level_command(const char* args) {
-  char name[16], value[8];
-  int n = sscanf(args, " %15s %7s", name, value);
-  if (n <= 0) {
-    print_levels();
-    return;
-  }
-  bool strip = !strncasecmp(name, "strip_", 6);
-  const char* base = strip ? name + 6 : name;
-  int c = -1;
-  for (uint8_t i = 0; i < sl::kAlarm; i++)
-    if (!strcasecmp(base, kChannelNames[i])) c = i;
-  uint16_t tenths;
-  if (n != 2 || c < 0 || !sl::parse_level(value, &tenths)) {
-    log_line("level: use 'level red|green|blue|strip_red|strip_green|strip_blue 0..100' (e.g. 27.5)");
-    return;
-  }
-  char text[8];
-  sl::format_level(tenths, text, sizeof text);
-  if (strip) {
-    cfg.strip_level[c] = tenths;  // strip_tick sends the new colour on the next loop
-  } else {
-    cfg.level[c] = tenths;
-    configure_output((uint8_t)c);
-  }
-  log_line("level: %s%s %s%% (PWM duty %u/255) until reboot; 'save' keeps it", strip ? "strip_" : "",
-           kChannelNames[c], text, sl::level_duty(tenths));
 }
 
 void print_strip_timing(int index, const char* prefix) {
@@ -656,6 +650,24 @@ void strip_loopback_command() {
            (long)(((int64_t)took_ns - ideal_ns) / (int64_t)frame));
 }
 
+void strip_index_command(const char* args) {
+  while (*args == ' ') args++;
+  if (!strcmp(args, "off")) {
+    strip_index_on = false;
+    strip_sent_once = false;
+    log_line("strip_index: off, showing the light again");
+    return;
+  }
+  strip_raw_len = 0;
+  strip_index_on = true;
+  strip_sent_once = false;
+  log_line("strip_index: physical pixels in wiring order (layout ignored), blocks of 5 fading 100/32/10/3/1 %%:");
+  for (int b = 0; b * 5 < cfg.strip_pixels; b++) {
+    int last = b * 5 + 4 < cfg.strip_pixels - 1 ? b * 5 + 4 : cfg.strip_pixels - 1;
+    log_line("  pixels %d-%d %s", b * 5, last, kIndexNames[b % 10]);
+  }
+}
+
 // Writes data to a file on the SD card, replacing it, then reads it back to check.
 bool write_file(const char* name, const char* data, size_t len) {
   File f = SD.open(name, O_WRITE | O_CREAT | O_TRUNC);
@@ -713,28 +725,28 @@ bool update_settings_file(const char* const keys[], const char* const values[], 
   return true;
 }
 
-// "save": writes the current levels (the light's, and the strip's if there is one) into settings.ini.
-void save_levels() {
-  char values[6][8];
-  for (uint8_t c = 0; c < 3; c++) {
-    sl::format_level(cfg.level[c], values[c], sizeof values[c]);
-    sl::format_level(cfg.strip_level[c], values[3 + c], sizeof values[3 + c]);
+// "unset <key>": removes a key's lines from settings.ini (e.g. old ones), so its default applies after a reboot.
+void unset_command(const char* args) {
+  while (*args == ' ') args++;
+  char key[32];
+  size_t k = 0;
+  while (args[k] && args[k] != ' ' && k < sizeof key - 1) {
+    key[k] = args[k];
+    k++;
   }
-  const char* const keys[6] = {"red_level", "green_level", "blue_level",
-                               "strip_red_level", "strip_green_level", "strip_blue_level"};
-  const char* const vals[6] = {values[0], values[1], values[2], values[3], values[4], values[5]};
-  size_t n = strip_com ? 6 : 3;
-  if (!update_settings_file(keys, vals, n, "save")) return;
-  log_line("save: %s now has red_level=%s, green_level=%s, blue_level=%s (previous copy: %s)", kSettingsFile,
-           values[0], values[1], values[2], kBackupFile);
-  if (strip_com) {
-    log_line("save: and strip_red_level=%s, strip_green_level=%s, strip_blue_level=%s", values[3], values[4],
-             values[5]);
+  key[k] = '\0';
+  if (!key[0]) {
+    log_line("unset: use 'unset <key>', e.g. 'unset green_level'");
+    return;
   }
+  const char* const keys[1] = {key};
+  const char* const vals[1] = {nullptr};
+  if (!update_settings_file(keys, vals, 1, "unset")) return;
+  log_line("unset: %s removed from %s (previous copy: %s); type 'reboot' to apply", key, kSettingsFile, kBackupFile);
 }
 
 // "set <key> <value>": checks one setting the way settings.ini is read, then writes it into settings.ini.
-// It takes effect after a reboot (levels can be tried live with "level" first).
+// It takes effect after a reboot.
 void set_command(const char* args) {
   while (*args == ' ') args++;
   char key[32];
@@ -764,7 +776,7 @@ void set_command(const char* args) {
 }
 
 void console_tick() {
-  static char line[160];
+  static char line[640];
   static size_t len = 0;
   while (Serial.available() > 0) {
     int c = Serial.read();
@@ -779,14 +791,14 @@ void console_tick() {
     if (n == 0) continue;
     if (!strcmp(line, "status") || !strcmp(line, "?")) {
       print_status();
-    } else if (!strncmp(line, "level", 5) && (line[5] == '\0' || line[5] == ' ')) {
-      level_command(line + 5);
-    } else if (!strcmp(line, "save")) {
-      save_levels();
+    } else if (!strncmp(line, "unset ", 6)) {
+      unset_command(line + 6);
     } else if (!strncmp(line, "set ", 4)) {
       set_command(line + 4);
     } else if (!strcmp(line, "strip_loopback") && strip_com) {
       strip_loopback_command();
+    } else if (!strncmp(line, "strip_index", 11) && (line[11] == '\0' || line[11] == ' ') && strip_com) {
+      strip_index_command(line + 11);
     } else if (!strncmp(line, "strip_raw", 9) && (line[9] == '\0' || line[9] == ' ')) {
       strip_raw_command(line + 9);
     } else if (!strncmp(line, "strip_timing", 12) && (line[12] == '\0' || line[12] == ' ')) {
@@ -800,9 +812,8 @@ void console_tick() {
       delay(100);
       SysMgr.ResetBoard();
     } else if (!strcmp(line, "help")) {
-      log_line("commands: a light command (e.g. GREEN, RED,FAST, YELLOW,SLOW;ALARM,FAST, FIRE, OFF), status,");
-      log_line("  level [channel 0..100], save (writes the levels to %s), set <key> <value>, reboot, help",
-               kSettingsFile);
+      log_line("commands: a light command (e.g. GREEN, RED,FAST, IO4=100;IO5=26, STRIP[0-9]=100,0,0, OFF), status,");
+      log_line("  set <key> <value> and unset <key> (edit %s), reboot, help", kSettingsFile);
       log_line("  strip tests: strip_timing [n], strip_raw <hex bytes per pixel>, strip_loopback (pin 5 to 3)");
     } else {
       apply_command(line, n, "console");
@@ -821,7 +832,7 @@ void setup() {
   if (mqtt_enabled) {
     mqtt.setServer(cfg.broker, cfg.port);
     mqtt.setCallback(on_message);
-    mqtt.setBufferSize(512);
+    mqtt.setBufferSize(1200);  // long STRIP commands
     EthernetMgr.Setup();  // brings up the PHY so the link can be checked; DHCP waits for a link
     next_net_try = millis();
   }
