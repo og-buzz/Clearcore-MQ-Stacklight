@@ -1,6 +1,8 @@
 // Settings.cpp — see Settings.h.
 #include "Settings.h"
 
+#include "Strip.h"
+
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,8 +80,16 @@ void defaults(Settings* s) {
   memset(s, 0, sizeof *s);
   s->port = 1883;
   s->dhcp = true;
-  for (uint8_t c = 0; c < kChannels; c++) s->pin[c] = kNoPin;  // nothing driven until configured
+  for (uint8_t c = 0; c < kChannels; c++) {
+    s->pin[c] = kNoPin;  // nothing driven until configured
+    s->level[c] = 1000;
+  }
   s->button = kNoPin;
+  s->strip_port = kNoStrip;  // no strip until configured: a COM port may have other hardware on it
+  s->strip_pixels = 0;
+  for (uint8_t c = 0; c < 3; c++) s->strip_level[c] = 1000;
+  s->strip_timing = 4;  // verified on BTF's WS2805 strip (see Strip.h)
+  for (uint8_t i = 0; i < 3; i++) s->strip_order[i] = i;  // R G B, as the WS2805 datasheet says
   s->timing = {350, 150, 750, 250};
   s->allow_reset = false;
 }
@@ -145,6 +155,55 @@ bool apply_line(Settings* s, const char* line, char* err, size_t err_cap) {
       return true;
     }
   }
+  const char* const level_keys[kAlarm] = {"red_level", "green_level", "blue_level"};
+  for (uint8_t c = 0; c < kAlarm; c++) {
+    if (!strcmp(key, level_keys[c])) {
+      if (!parse_level(value, &s->level[c])) return fail(err, err_cap, "must be 0..100 (percent, e.g. 27.5)", key), false;
+      return true;
+    }
+  }
+  if (!strcmp(key, "strip")) {
+    char up[8];
+    size_t n = strlen(value);
+    if (n >= sizeof up) return fail(err, err_cap, "must be COM0, COM1 or none", key), false;
+    for (size_t i = 0; i <= n; i++) up[i] = (char)toupper((unsigned char)value[i]);
+    if (!strcmp(up, "NONE") || up[0] == '\0') s->strip_port = kNoStrip;
+    else if (!strcmp(up, "COM0")) s->strip_port = 0;
+    else if (!strcmp(up, "COM1")) s->strip_port = 1;
+    else return fail(err, err_cap, "must be COM0, COM1 or none", key), false;
+    return true;
+  }
+  if (!strcmp(key, "strip_pixels")) {
+    if (!parse_uint(value, kStripMaxPixels, &u) || u == 0) return fail(err, err_cap, "must be 1..300", key), false;
+    s->strip_pixels = (uint16_t)u;
+    return true;
+  }
+  if (!strcmp(key, "strip_order")) {
+    uint8_t order[3];
+    bool seen[3] = {false, false, false};
+    if (strlen(value) != 3) return fail(err, err_cap, "must be RGB, GRB or another order of R, G and B", key), false;
+    for (int i = 0; i < 3; i++) {
+      char ch = (char)toupper((unsigned char)value[i]);
+      int c = ch == 'R' ? 0 : ch == 'G' ? 1 : ch == 'B' ? 2 : -1;
+      if (c < 0 || seen[c]) return fail(err, err_cap, "must be RGB, GRB or another order of R, G and B", key), false;
+      seen[c] = true;
+      order[i] = (uint8_t)c;
+    }
+    memcpy(s->strip_order, order, 3);
+    return true;
+  }
+  if (!strcmp(key, "strip_timing")) {
+    if (!parse_uint(value, kStripTimings - 1, &u)) return fail(err, err_cap, "must be 0..5", key), false;
+    s->strip_timing = (uint8_t)u;
+    return true;
+  }
+  const char* const strip_level_keys[3] = {"strip_red_level", "strip_green_level", "strip_blue_level"};
+  for (uint8_t c = 0; c < 3; c++) {
+    if (!strcmp(key, strip_level_keys[c])) {
+      if (!parse_level(value, &s->strip_level[c])) return fail(err, err_cap, "must be 0..100 (percent, e.g. 27.5)", key), false;
+      return true;
+    }
+  }
   if (!strcmp(key, "button")) {
     if (!parse_pin(value, false, &s->button)) return fail(err, err_cap, "must be IO0..IO5, DI6..DI8 or none", key), false;
     return true;
@@ -165,6 +224,14 @@ bool apply_line(Settings* s, const char* line, char* err, size_t err_cap) {
   }
   fail(err, err_cap, "unknown setting", key);
   return false;
+}
+
+bool strip_ready(const Settings& s, char* err, size_t err_cap) {
+  if (err && err_cap) err[0] = '\0';
+  if (s.strip_port == kNoStrip && s.strip_pixels == 0) return false;  // not configured: nothing to report
+  if (s.strip_port == kNoStrip) return fail(err, err_cap, "not set (COM0 or COM1), but strip_pixels is", "strip"), false;
+  if (s.strip_pixels == 0) return fail(err, err_cap, "not set", "strip_pixels"), false;
+  return true;
 }
 
 bool mqtt_ready(const Settings& s, char* err, size_t err_cap) {
@@ -200,6 +267,91 @@ bool pins_ok(const Settings& s, char* err, size_t err_cap) {
 bool topic(const Settings& s, const char* kind, char* out, size_t cap) {
   int n = snprintf(out, cap, "%s/%s/%s/%s/%s", s.project, s.client, s.site, s.role, kind);
   return n > 0 && (size_t)n < cap;
+}
+
+bool parse_level(const char* text, uint16_t* tenths) {
+  unsigned whole = 0, frac = 0;
+  const char* p = text;
+  if (!isdigit((unsigned char)*p)) return false;
+  for (; isdigit((unsigned char)*p); p++) {
+    whole = whole * 10 + (unsigned)(*p - '0');
+    if (whole > 100) return false;
+  }
+  if (*p == '.') {
+    p++;
+    if (!isdigit((unsigned char)*p)) return false;
+    frac = (unsigned)(*p++ - '0');
+  }
+  if (*p != '\0') return false;  // more than one decimal, or junk
+  unsigned t = whole * 10 + frac;
+  if (t > 1000) return false;
+  *tenths = (uint16_t)t;
+  return true;
+}
+
+void format_level(uint16_t tenths, char* out, size_t cap) {
+  if (tenths % 10) snprintf(out, cap, "%u.%u", tenths / 10u, tenths % 10u);
+  else snprintf(out, cap, "%u", tenths / 10u);
+}
+
+// Index in keys[] of the key this settings line sets, or -1 for comments, blank lines and other keys.
+static int line_key(const char* line, size_t len, const char* const keys[], size_t n) {
+  size_t i = 0;
+  while (i < len && isspace((unsigned char)line[i])) i++;
+  if (i == len || line[i] == '#' || line[i] == ';') return -1;
+  const char* eq = (const char*)memchr(line + i, '=', len - i);
+  if (!eq) return -1;
+  size_t end = (size_t)(eq - line);
+  while (end > i && isspace((unsigned char)line[end - 1])) end--;
+  for (size_t k = 0; k < n; k++) {
+    if (strlen(keys[k]) == end - i && memcmp(line + i, keys[k], end - i) == 0) return (int)k;
+  }
+  return -1;
+}
+
+long set_keys(const char* in, size_t len, const char* const keys[], const char* const values[], size_t n, char* out,
+              size_t cap) {
+  if (n > 8 || cap == 0) return -1;
+  bool found[8] = {false};
+  bool crlf = false;
+  size_t used = 0;
+  auto put = [&](const char* p, size_t k) {
+    if (used + k >= cap) return false;  // keep room for the terminator
+    memcpy(out + used, p, k);
+    used += k;
+    return true;
+  };
+  auto put_setting = [&](size_t k) {
+    return put(keys[k], strlen(keys[k])) && put("=", 1) && put(values[k], strlen(values[k]));
+  };
+  size_t i = 0;
+  while (i < len) {
+    size_t start = i;
+    while (i < len && in[i] != '\n') i++;
+    size_t text_end = i;
+    if (i < len) i++;  // the line now spans [start, i), terminator included
+    if (text_end > start && in[text_end - 1] == '\r') {
+      text_end--;
+      crlf = true;
+    }
+    int k = line_key(in + start, text_end - start, keys, n);
+    if (k < 0) {
+      if (!put(in + start, i - start)) return -1;
+      continue;
+    }
+    found[k] = true;
+    if (!put_setting((size_t)k) || !put(in + text_end, i - text_end)) return -1;
+  }
+  const char* eol = crlf ? "\r\n" : "\n";
+  bool need_eol = len > 0 && in[len - 1] != '\n';
+  for (size_t k = 0; k < n; k++) {
+    if (found[k]) continue;
+    if (need_eol && !put(eol, strlen(eol))) return -1;
+    need_eol = false;
+    if (!put_setting(k) || !put(eol, strlen(eol))) return -1;
+  }
+  out[used] = '\0';
+  return (long)used;
 }
 
 const char* pin_name(int8_t pin) {

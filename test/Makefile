@@ -1,11 +1,11 @@
 CXX ?= g++
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -Werror -O1 -g
-SRC = ../ClearCoreStackLight/Light.cpp ../ClearCoreStackLight/Settings.cpp test_main.cpp
+SRC = ../ClearCoreStackLight/Light.cpp ../ClearCoreStackLight/Settings.cpp ../ClearCoreStackLight/Strip.cpp test_main.cpp
 
 test: run_tests
 	./run_tests
 
-run_tests: $(SRC) ../ClearCoreStackLight/Light.h ../ClearCoreStackLight/Settings.h
+run_tests: $(SRC) ../ClearCoreStackLight/Light.h ../ClearCoreStackLight/Settings.h ../ClearCoreStackLight/Strip.h
 	$(CXX) $(CXXFLAGS) -o $@ $(SRC)
 
 clean:

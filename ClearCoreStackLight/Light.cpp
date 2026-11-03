@@ -142,6 +142,11 @@ void lit(const State& s, const Timing& t, uint32_t now, bool out[kChannels]) {
   }
 }
 
+uint8_t level_duty(uint16_t tenths) {
+  if (tenths >= 1000) return 255;
+  return (uint8_t)((tenths * 255u + 500u) / 1000u);
+}
+
 void describe(const State& s, char* out, size_t cap) {
   if (!cap) return;
   out[0] = '\0';

@@ -37,6 +37,9 @@ bool parse_command(const char* text, size_t len, State* out, char* err, size_t e
 // same mode blink together (red + green for yellow stay in step).
 void lit(const State& s, const Timing& t, uint32_t now_ms, bool out[kChannels]);
 
+// PWM duty (0..255) for a brightness level in tenths of a percent (0..1000; more counts as 1000).
+uint8_t level_duty(uint16_t tenths);
+
 // Canonical text for a state, e.g. "YELLOW,SLOW;ALARM,FAST" or "OFF". Parses back to the same state.
 void describe(const State& s, char* out, size_t cap);
 

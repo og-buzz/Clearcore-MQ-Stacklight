@@ -39,9 +39,14 @@ Copy [`settings.example.ini`](settings.example.ini) to the root of the microSD c
 | `asset` | The unit's asset tag (e.g. `cc-0001`); used as the MQTT client ID |
 | `ip` | `dhcp` (default) or a static address, with `gateway`, `dns` and `subnet` |
 | `red`, `green`, `blue`, `alarm` | Output for each channel: `IO0`..`IO5` or `none` |
+| `red_level`, `green_level`, `blue_level` | Brightness of each colour when lit, `0`..`100` % with up to one decimal, e.g. `27.5` (default `100`). Below 100 the output runs as PWM, so a bright colour can be turned down to balance mixes like yellow |
 | `button` | Input for a push button: `IO0`..`IO5`, `DI6`..`DI8` or `none` |
 | `fast_on`, `fast_off`, `slow_on`, `slow_off` | Blink timing in milliseconds |
 | `allow_reset` | `true` to allow a reboot over MQTT (default `false`) |
+| `strip`, `strip_pixels` | A WS2805 strip on `COM0` or `COM1` with this many pixels (default `none`); it mirrors the light |
+| `strip_red_level`, `strip_green_level`, `strip_blue_level` | Brightness of each colour on the strip, `0`..`100` % (default `100`) |
+| `strip_order` | Colour order on the wire: `RGB` (default, WS2805 datasheet), `GRB` (BTF's WS2805 strip), or any other order of R, G and B |
+| `strip_timing` | Signal timing `0`..`5` (default `4`, see below) |
 
 Problems in the file (unknown keys, bad values, two channels on one pin) are printed on the USB serial port at boot. A bad line is ignored; two channels on one pin disables all outputs.
 
@@ -72,9 +77,34 @@ mosquitto_pub -h <broker> -t stacklight/acme/main-plant/cc-01/command -r -m 'OFF
 
 The 2024 payloads such as `RED,ON` and `ALL,OFF` still work, with one change: each command now sets the whole light, so `GREEN,ON` turns red off.
 
+## Addressable strip
+
+A WS2805 RGBCCT strip on COM-0 or COM-1 shows the same colours and blinking as the light, every pixel alike
+(the whites stay off for now). The ClearCore has no fast logic-level output, so the WS2805 signal is made
+on the COM port's SPI data line by DMA. With the default timing 4, every data bit is 13 SPI bits at 12 MHz:
+`0` = 333 ns high / 750 ns low, `1` = 750 / 333 ns (NeoPixelBus/WLED use 300/790 and 790/300 ns for the
+WS2805), then a 300 µs reset. 12 MHz needs the port's SPI clocked from the ClearCore's 48 MHz generator
+instead of the library's 10 MHz one; the sketch does that. It also turns off the port's hardware slave
+select, which the ClearCore library enables for SPI and which pauses about three clock periods after every
+byte: enough to stretch pulses at every byte boundary and make the strip misread its data.
+
+Each pixel is five bytes: three colours, then the two whites (off for now). The colour order varies by
+strip; BTF's WS2805 strip wants `strip_order=GRB`.
+
+| RJ-45 pin (COM port) | Strip |
+|---|---|
+| 5 (data) | DIN, and BIN (backup data) on dual-data strips: BTF's WS2805 manual joins both to the data output |
+| 4 (GND) | GND, also to the 24 V supply's negative |
+| 2, 6 (5 V), 1, 3, 7, 8 | not connected |
+
+Power the strip from the 24 V supply, not from the ClearCore, and connect to the end where the arrows on
+the strip point away from the connection.
+
 ## USB serial console
 
-At 115200 baud the USB port takes the same light commands, plus `status` (settings, network, MQTT and light state; never the password) and `help`. That makes it possible to test the wiring before the network is set up.
+At 115200 baud the USB port takes the same light commands, plus `status` (settings, network, MQTT and light state; never the password), `level`, `save`, `set`, `reboot` and `help`. `level green 40` sets a colour's brightness until the next reboot, for finding the right `*_level` values by eye; `save` then writes the current levels into `settings.ini` (keeping the rest of the file, with the previous version in `settings.bak`). The strip's levels are `strip_red`, `strip_green` and `strip_blue`. `set <key> <value>` checks any setting and writes it into `settings.ini` the same way, e.g. `set strip COM0`; `reboot` applies it.
+
+For bringing up a new strip: `strip_timing [n]` lists or switches the signal timing until a reboot; `strip_raw <hex>` sends the same raw bytes to every pixel (e.g. `strip_raw 000000ff00` lights only the first white) until the light changes; `strip_loopback`, with a wire from the COM port's pin 5 to pin 3, reads the data line back and times a frame to check the bytes go out without pauses. That makes it possible to test the wiring before the network is set up.
 
 ## Tests
 
