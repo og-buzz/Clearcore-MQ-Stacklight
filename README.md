@@ -16,12 +16,12 @@ Drive a stack light from MQTT with a [Teknic ClearCore](https://www.teknic.com/p
 
 The sketch uses the `ClearCore:sam` Arduino core, the [PubSubClient](https://github.com/knolleary/pubsubclient)
 library and [ClearCoreWatchdog](https://github.com/og-buzz/ClearCoreWatchdog) 1.1.0 or later (see
-[Watchdog](#watchdog); until 1.1.0 is released, its `feature/always-on-early-warning` branch):
+[Watchdog](#watchdog)):
 
 ```bash
 arduino-cli lib install PubSubClient
 arduino-cli config set library.enable_unsafe_install true   # needed for --git-url
-arduino-cli lib install --git-url https://github.com/og-buzz/ClearCoreWatchdog.git#feature/always-on-early-warning
+arduino-cli lib install --git-url https://github.com/og-buzz/ClearCoreWatchdog.git#v1.1.0
 arduino-cli compile --fqbn ClearCore:sam:clearcore ClearCoreStackLight
 ```
 
@@ -228,7 +228,7 @@ then reads them back, kicks from the start of `setup()`, and shows them in `stat
 margin for DHCP and the MQTT connect, so the light keeps the network off and says to power-cycle it.
 
 The watchdog comes from [ClearCoreWatchdog](https://github.com/og-buzz/ClearCoreWatchdog), which needs its
-early-warning support: the `feature/always-on-early-warning` branch or a release from 1.1.0 on.
+early-warning support: [1.1.0](https://github.com/og-buzz/ClearCoreWatchdog/releases/tag/v1.1.0) or later.
 
 ## Tests
 
