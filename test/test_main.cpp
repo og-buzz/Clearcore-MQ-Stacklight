@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../ClearCoreStackLight/Breadcrumb.h"
 #include "../ClearCoreStackLight/Light.h"
 #include "../ClearCoreStackLight/Settings.h"
 #include "../ClearCoreStackLight/Strip.h"
@@ -898,6 +899,98 @@ static void test_scenes() {
   CHECK(!s.allow_config && apply_line(&s, "allow_config=true", err, sizeof err) && s.allow_config);
 }
 
+// The watchdog breadcrumb: step names, the record that survives a reset, and the reset report.
+static void test_breadcrumb() {
+  CHECK(!strcmp(step_name(kStepMqttConnect), "mqtt-connect") && !strcmp(step_name(kStepSdWrite), "sd-write"));
+  CHECK(!strcmp(step_name(kStepWatchdogTest), "watchdog-test") && !strcmp(step_name(kStepBoot), "boot"));
+  CHECK(!strcmp(step_name(kStepCount), "unknown") && !strcmp(step_name(255), "unknown"));
+  for (int i = 0; i < kStepCount; i++) {  // every step has its own name, short enough for the status line
+    CHECK(strcmp(step_name((uint8_t)i), "unknown") != 0 && strlen(step_name((uint8_t)i)) < 16);
+    for (int j = 0; j < i; j++) CHECK(strcmp(step_name((uint8_t)i), step_name((uint8_t)j)) != 0);
+  }
+
+  CHECK(!strcmp(reset_cause_name(kCauseWdt), "watchdog") && !strcmp(reset_cause_name(kCausePor), "power-on"));
+  CHECK(!strcmp(reset_cause_name(kCauseSyst), "software") && !strcmp(reset_cause_name(kCauseExt), "reset pin"));
+  CHECK(!strcmp(reset_cause_name(0), "unknown"));
+
+  Crumb c;
+  memset(&c, 0, sizeof c);
+  uint8_t step = 99;
+  uint32_t up = 99;
+  CHECK(!crumb_read(&c, &step, &up) && step == 99);  // zeroed RAM: no record
+  crumb_write(&c, kStepMqttConnect, 3600);
+  CHECK(crumb_read(&c, &step, &up) && step == kStepMqttConnect && up == 3600);
+  crumb_write(&c, kStepDhcp, 0xFFFFFFFFu);  // uptime is millis() / 1000: any value, no wrap assumptions
+  CHECK(crumb_read(&c, &step, &up) && step == kStepDhcp && up == 0xFFFFFFFFu);
+  crumb_clear(&c);
+  CHECK(!crumb_read(&c, &step, &up));
+
+  // Damaged records are rejected: a torn write, a changed field, random RAM after a power-on.
+  crumb_write(&c, kStepSdWrite, 120);
+  Crumb bad = c;
+  bad.uptime_s = 121;
+  CHECK(!crumb_read(&bad, &step, &up));
+  bad = c;
+  bad.step = kStepStrip;
+  CHECK(!crumb_read(&bad, &step, &up));
+  bad = c;
+  bad.step = 0x100 + kStepSdWrite;
+  CHECK(!crumb_read(&bad, &step, &up));
+  bad = c;
+  bad.check ^= 1;
+  CHECK(!crumb_read(&bad, &step, &up));
+  bad = c;
+  bad.magic = 0;  // the interrupt was cut off before the last store
+  CHECK(!crumb_read(&bad, &step, &up));
+  srand(7);
+  int accepted = 0;
+  for (int i = 0; i < 10000; i++) {
+    uint32_t w[4];
+    for (uint32_t& x : w) x = ((uint32_t)rand() << 16) ^ (uint32_t)rand();
+    memcpy(&bad, w, sizeof bad);
+    bad.magic = kCrumbMagic;  // even with the magic right, random fields fail the check
+    if (crumb_read(&bad, &step, &up)) accepted++;
+  }
+  CHECK(accepted == 0);
+
+  char out[64];
+  reset_report(out, sizeof out, kCauseWdt, true, kStepMqttConnect, 3600);
+  CHECK(!strcmp(out, "watchdog in mqtt-connect after 3600 s"));
+  reset_report(out, sizeof out, kCauseWdt, false, kStepMqttConnect, 3600);
+  CHECK(!strcmp(out, "watchdog (no breadcrumb)"));
+  reset_report(out, sizeof out, kCauseWdt, true, 200, 5);
+  CHECK(!strcmp(out, "watchdog in unknown after 5 s"));
+  reset_report(out, sizeof out, kCausePor, true, kStepMqttConnect, 3600);  // a crumb only counts after a WDT reset
+  CHECK(!strcmp(out, "power-on"));
+  reset_report(out, sizeof out, kCauseSyst, false, 0, 0);
+  CHECK(!strcmp(out, "software"));
+  char tiny[12];
+  reset_report(tiny, sizeof tiny, kCauseWdt, true, kStepMqttConnect, 3600);
+  CHECK(strlen(tiny) == sizeof tiny - 1 && !strncmp(tiny, "watchdog in", 11));
+  reset_report(tiny, 0, kCauseWdt, true, kStepMqttConnect, 3600);  // no room: nothing written, no crash
+
+  CHECK(kick_due(1250, 1000, 250) && !kick_due(1249, 1000, 250));
+  CHECK(kick_due(300, 0xFFFFFFF0u, 250) && !kick_due(5, 0xFFFFFFF0u, 250));  // across the millis() wrap
+
+  // WDT codes as the library's WdtPeriod enum and the registers use them: 0x7 is 1 s, 0xB is 16 s.
+  CHECK(wdt_code_ms(0x7) == 1000 && wdt_code_ms(0x9) == 4000 && wdt_code_ms(0xA) == 8000);
+  CHECK(wdt_code_ms(0xB) == 16000 && wdt_code_ms(0x6) == 500 && wdt_code_ms(0x0) == 7);
+  CHECK(wdt_code_ms(0xC) == 0 && wdt_code_ms(0xF) == 0);  // reserved
+  CHECK(wdt_period_fits(16000, 8000) && wdt_period_fits(12000, 8000));
+  CHECK(!wdt_period_fits(8000, 8000) && !wdt_period_fits(11999, 8000) && !wdt_period_fits(0, 8000));
+  duration_text(out, sizeof out, 16000);
+  CHECK(!strcmp(out, "16 s"));
+  duration_text(out, sizeof out, 500);
+  CHECK(!strcmp(out, "500 ms"));
+  duration_text(out, sizeof out, 7);
+  CHECK(!strcmp(out, "7 ms"));
+  duration_text(out, sizeof out, 0);
+  CHECK(!strcmp(out, "0 ms"));
+  duration_text(tiny, 3, 16000);
+  CHECK(!strcmp(tiny, "16"));
+  duration_text(tiny, 0, 16000);  // no room: nothing written, no crash
+}
+
 int main() {
   test_commands();
   test_blink();
@@ -912,6 +1005,7 @@ int main() {
   test_pulse();
   test_pix();
   test_scenes();
+  test_breadcrumb();
   if (failures) {
     fprintf(stderr, "%d check(s) failed\n", failures);
     return 1;

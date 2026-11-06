@@ -23,25 +23,32 @@
 // output (PWM), and STRIP items set the pixels of an addressable WS2805 strip on COM-0 or COM-1 (strip= and
 // strip_pixels= in settings.ini); without STRIP items the strip shows the colour names (see Light.h, Strip.h).
 //
-// The USB serial port (115200 baud) takes the same commands, plus "status", "set", "unset", "reboot", "help"
-// and the strip tests "strip_timing", "strip_raw" and "strip_loopback".
+// The USB serial port (115200 baud) takes the same commands, plus "status", "set", "unset", "reboot", "help",
+// the strip tests "strip_timing", "strip_raw" and "strip_loopback", and "watchdog_test".
 //
-// FQBN: ClearCore:sam:clearcore. Needs the PubSubClient library (arduino-cli lib install PubSubClient).
+// A hardware watchdog (16 s, normal mode) resets the board if the loop hangs. Its early warning, 8 s after the
+// last kick, saves the loop's current step to backup RAM; the next boot reports it (see Breadcrumb.h). If
+// earlier firmware left the watchdog in Always-On mode, its period stays until a power cycle (see arm_watchdog).
+//
+// FQBN: ClearCore:sam:clearcore. Needs the PubSubClient library (arduino-cli lib install PubSubClient) and
+// ClearCoreWatchdog 1.1.0 or later, for its early warning (see README.md).
 
 #include <ClearCore.h>
+#include <ClearCoreWatchdog.h>
 #include <Ethernet.h>
 #include <PubSubClient.h>
 #include <SD.h>
 #include <stdarg.h>
 #include <strings.h>
 
+#include "Breadcrumb.h"
 #include "Light.h"
 #include "Settings.h"
 #include "Strip.h"
 
 namespace {
 
-const char* const kVersion = "2.5.0";
+const char* const kVersion = "2.6.0";
 const char* const kSettingsFile = "settings.ini";
 const char* const kBackupFile = "settings.bak";  // the previous settings.ini, written by "set" and "unset"
 const uint32_t kNetRetryMs = 10000;
@@ -110,14 +117,180 @@ EthernetClient eth;
 PubSubClient mqtt(eth);
 bool net_up = false;
 uint32_t next_net_try = 0, next_mqtt_try = 0, mqtt_backoff = kMqttBackoffMinMs, subscribed_at = 0;
+// PubSubClient waits this long for CONNACK and for each byte of a packet (default 15 s); with the DNS lookup
+// (2 s) and the TCP connect below, a connect stays at about 7 s, under the watchdog's 8 s early warning.
+const uint16_t kMqttSocketTimeoutS = 3;
+const uint16_t kTcpConnectTimeoutMs = 2000;
+
+// USB console output. Serial.println waits with no time limit while a host holds the port open but doesn't
+// read, so log_line writes only what fits, waiting at most kLogWaitMs per line, and drops the rest.
+const uint32_t kLogWaitMs = 50;
+uint32_t log_dropped = 0;  // lines cut short or dropped
 
 void log_line(const char* fmt, ...) {
   static char buf[640];
+  static bool stalled = false;  // the last line didn't get out: don't wait again until one does
   va_list args;
   va_start(args, fmt);
-  vsnprintf(buf, sizeof buf, fmt, args);
+  vsnprintf(buf, sizeof buf - 2, fmt, args);
   va_end(args);
-  Serial.println(buf);
+  strcat(buf, "\r\n");
+  const uint32_t start = millis();
+  for (const char* p = buf; *p; p++) {
+    while (Serial.availableForWrite() <= 0) {
+      if (stalled || millis() - start >= kLogWaitMs) {
+        stalled = true;
+        log_dropped++;
+        return;
+      }
+    }
+    Serial.write((uint8_t)*p);
+  }
+  stalled = false;
+}
+
+// --- watchdog --------------------------------------------------------------------------------
+//
+// Normal mode, not Always-On, so a reflash or the bootloader never races it. Every call that can block is
+// bounded below the period (see README.md, Watchdog); the loop kicks through step(), which also records the
+// step for the breadcrumb.
+
+const WdtPeriod kWdtPeriod = WdtPeriod_16s;
+const WdtPeriod kWdtWarning = WdtPeriod_8s;  // must be shorter than the period or it isn't armed
+// The longest call between two kicks: DHCP, 5 tries of 1.5 s plus overhead (an MQTT connect stays near 7 s).
+const uint32_t kLongestCallMs = 8000;
+const uint32_t kKickGapMs = 250;  // a kick waits for the watchdog's 1 kHz clock domain: don't kick every pass
+
+static_assert(sizeof(sl::Crumb) <= BKUPRAM_SIZE, "the breadcrumb must fit in backup RAM");
+static_assert(sl::kCauseWdt == RSTC_RCAUSE_WDT && sl::kCausePor == RSTC_RCAUSE_POR, "RCAUSE bits");
+
+// The breadcrumb lives at the start of the SAME53's backup RAM: no startup code, ours or the bootloader's,
+// clears it, and a watchdog reset keeps it. A .noinit variable in main RAM would not work: the linker places
+// it inside the bootloader's .bss, which the bootloader zeroes on every reset.
+volatile sl::Crumb* crumb() { return reinterpret_cast<volatile sl::Crumb*>(BKUPRAM_ADDR); }
+
+volatile uint8_t wdt_step = sl::kStepBoot;  // what the loop is doing now
+volatile bool wdt_warned = false;           // set by the early warning, handled by the next kick
+bool wdt_armed = false, wdt_always_on = false;
+// The period and early-warning offset in force (0: no early warning). In Always-On they are read back from
+// the watchdog, since earlier firmware chose them.
+uint32_t wdt_period_ms = 0, wdt_warning_ms = 0;
+// Always-On with a period too short for kLongestCallMs: a DHCP or MQTT connect that runs into its time limit
+// would reset the board on every try, so the network stays off until a power cycle clears Always-On.
+bool wdt_too_short = false;
+uint32_t last_kick = 0;
+uint32_t wdt_warnings = 0;  // early warnings without a reset: a step outlasted the offset, not the period
+bool warning_to_log = false;
+uint8_t warned_step = sl::kStepCount;
+uint32_t warned_uptime = 0;
+char last_reset[64];        // "watchdog in mqtt-connect after 3600 s", "power-on", ...
+bool report_reset = false;  // after a watchdog reset: publish it on the event topic once MQTT is up
+
+// Early warning, in interrupt context above every ClearCore interrupt: plain stores only (no Serial, SD,
+// network, log_line or Watchdog calls).
+void on_wdt_early_warning() {
+  sl::crumb_write(crumb(), wdt_step, millis() / 1000);
+  wdt_warned = true;
+}
+
+void kick() {
+  if (!wdt_armed) return;
+  Watchdog.kick();
+  last_kick = millis();
+  if (wdt_warned) {
+    // The early warning fired but the step finished in time: no reset follows. Drop the crumb, so a later
+    // reset whose early warning can't run (a hang with interrupts off) isn't reported against this step.
+    wdt_warned = false;
+    uint8_t s;
+    uint32_t up;
+    if (sl::crumb_read(crumb(), &s, &up)) {
+      warned_step = s;
+      warned_uptime = up;
+    }
+    sl::crumb_clear(crumb());
+    wdt_warnings++;
+    warning_to_log = true;
+  }
+}
+
+// Records the step the loop is in and kicks if the last kick is kKickGapMs old. Called often enough that no
+// stretch between two calls comes near the early warning.
+void step(sl::Step s) {
+  wdt_step = s;
+  if (sl::kick_due(millis(), last_kick, kKickGapMs)) kick();
+}
+
+// The same, kicking now: before a call that takes seconds (DHCP, an MQTT connect), so it gets the full time
+// to the early warning.
+void step_long(sl::Step s) {
+  wdt_step = s;
+  kick();
+}
+
+void arm_watchdog() {
+  // Before enable(), which arms it; in Always-On it arms the interrupt at the offset already locked in.
+  Watchdog.onEarlyWarning(on_wdt_early_warning, kWdtWarning);
+  if (Watchdog.enable(kWdtPeriod)) {
+    wdt_period_ms = sl::wdt_code_ms(kWdtPeriod);
+    wdt_warning_ms = sl::wdt_code_ms(kWdtWarning);
+  } else {
+    // Always-On, left by earlier firmware (a reflash doesn't clear it): CONFIG and EWCTRL are read-only until
+    // a power cycle and may hold any period, so read them back instead of assuming 16 s and 8 s.
+    wdt_always_on = true;
+    const uint8_t per = WDT->CONFIG.bit.PER, ew = WDT->EWCTRL.bit.EWOFFSET;
+    wdt_period_ms = sl::wdt_code_ms(per);
+    wdt_warning_ms = ew < per ? sl::wdt_code_ms(ew) : 0;  // an offset at or past the period never fires
+    wdt_too_short = !sl::wdt_period_fits(wdt_period_ms, kLongestCallMs);
+  }
+  wdt_armed = Watchdog.isEnabled();
+  // Free in normal mode. In Always-On the counter has run since the reset (bootloader, setup): restart it.
+  kick();
+}
+
+// The watchdog's settings for status and the log: "16 s", or for Always-On e.g. "Always-On 8 s, early warning
+// at 4 s, locked by earlier firmware until a power cycle; too short for DHCP and MQTT, which stay off".
+void wdt_describe(char* out, size_t cap) {
+  char period[16], warning[16];
+  sl::duration_text(period, sizeof period, wdt_period_ms);
+  sl::duration_text(warning, sizeof warning, wdt_warning_ms);
+  if (!wdt_always_on) {
+    snprintf(out, cap, "%s", period);
+    return;
+  }
+  snprintf(out, cap, "Always-On %s, %s%s, locked by earlier firmware until a power cycle%s", period,
+           wdt_warning_ms ? "early warning at " : "no early warning", wdt_warning_ms ? warning : "",
+           wdt_too_short ? "; too short for DHCP and MQTT, which stay off: power-cycle the light" : "");
+}
+
+void watchdog_tick() {
+  if (!warning_to_log) return;
+  warning_to_log = false;
+  char warning[16];
+  sl::duration_text(warning, sizeof warning, wdt_warning_ms);
+  log_line("watchdog: early warning in %s at %lu s, no reset (the step took over %s)", sl::step_name(warned_step),
+           (unsigned long)warned_uptime, warning);
+}
+
+// "watchdog_test" (USB console only): hangs on purpose, to check on the bench that the board resets and
+// reports it.
+void watchdog_test() {
+  if (!wdt_armed) {
+    log_line("watchdog_test: the watchdog isn't running");
+    return;
+  }
+  char period[16], warning[16];
+  sl::duration_text(period, sizeof period, wdt_period_ms);
+  sl::duration_text(warning, sizeof warning, wdt_warning_ms);
+  if (wdt_warning_ms) {
+    log_line("watchdog_test: WARNING: hanging on purpose; early warning in about %s, reset in about %s", warning,
+             period);
+    log_line("watchdog_test: after the reset, 'status' shows 'last reset watchdog in watchdog-test after ...'");
+  } else {
+    log_line("watchdog_test: WARNING: hanging on purpose; reset in about %s", period);
+    log_line("watchdog_test: no early warning in this Always-On setting, so 'status' shows 'watchdog (no breadcrumb)'");
+  }
+  step_long(sl::kStepWatchdogTest);
+  while (true) __asm__ volatile("");  // an empty endless loop is undefined in C++ and may be optimised away
 }
 
 // --- settings --------------------------------------------------------------------------------
@@ -320,7 +493,9 @@ void strip_tick() {
 }
 
 void update_light() {
+  step(sl::kStepStrip);
   strip_tick();
+  step(sl::kStepLight);
   uint8_t duty[sl::kIoPins];
   sl::io_duty(light, cfg.timing, millis(), cfg.pin, duty);
   for (int p = 0; p < sl::kIoPins; p++) {
@@ -368,7 +543,10 @@ bool apply_command(const char* text, size_t len, const char* source) {
 void start_network() {
   uint8_t unused_mac[6] = {0};  // the ClearCore always uses its own MAC address
   if (cfg.dhcp) {
+    // Up to 5 tries of 1.5 s, fixed in the ClearCore library: 7.5 s, inside the 8 s to the early warning.
+    step_long(sl::kStepDhcp);
     net_up = Ethernet.begin(unused_mac) != 0;
+    step_long(sl::kStepNetwork);
   } else {
     Ethernet.begin(unused_mac, IPAddress(cfg.ip), IPAddress(cfg.dns), IPAddress(cfg.gateway), IPAddress(cfg.subnet));
     net_up = true;
@@ -382,6 +560,19 @@ void start_network() {
 }
 
 bool update_settings_file(const char* const keys[], const char* const values[], size_t n, const char* who);
+
+// Reboots, telling the broker first. Not through mqtt.disconnect(): it waits for the socket to drain with no
+// time limit (minutes with a pulled cable), and the watchdog would then report the reboot as a hang. Without
+// a DISCONNECT the broker publishes the Last Will, the same retained "offline", so subscribers see no change.
+void reboot_now() {
+  step_long(sl::kStepReboot);
+  if (mqtt_enabled && mqtt.connected()) mqtt.publish(t_status, "offline", true);
+  const uint32_t start = millis();
+  while (millis() - start < 300) {  // lets the publish and the last log line go out
+    if (mqtt_enabled) Ethernet.maintain();  // only once setup() brought Ethernet up
+  }
+  SysMgr.ResetBoard();
+}
 
 // Shows a scene: its scene_<name> command, or a Teams state's built-in look. Returns false if there is none.
 bool play_scene(const char* name, const char* source) {
@@ -513,10 +704,7 @@ void on_message(char* topic, byte* payload, unsigned int length) {
     }
     log_line("mqtt: RESET received; rebooting");
     publish_event("resetting");
-    mqtt.publish(t_status, "offline", true);
-    mqtt.disconnect();
-    delay(200);
-    SysMgr.ResetBoard();
+    reboot_now();
   }
 }
 
@@ -526,7 +714,11 @@ void try_mqtt() {
   else snprintf(id, sizeof id, "%s.%s.%s.%s", cfg.project, cfg.client, cfg.site, cfg.role);
   const char* user = cfg.user[0] ? cfg.user : nullptr;
   const char* pass = cfg.password[0] ? cfg.password : nullptr;
-  if (mqtt.connect(id, user, pass, t_status, 1, true, "offline")) {
+  // DNS 2 s, TCP connect 2 s and CONNACK 3 s at most (setup() sets the last two), from a fresh kick.
+  step_long(sl::kStepMqttConnect);
+  const bool connected = mqtt.connect(id, user, pass, t_status, 1, true, "offline");
+  step_long(sl::kStepMqttConnect);
+  if (connected) {
     mqtt.publish(t_status, "online", true);
     mqtt.subscribe(t_command, 1);
     mqtt.subscribe(t_scene, 1);
@@ -539,6 +731,12 @@ void try_mqtt() {
     subscribed_at = millis();
     mqtt_backoff = kMqttBackoffMinMs;
     log_line("mqtt: connected to %s:%u as %s; listening on %s", cfg.broker, cfg.port, id, t_command);
+    if (report_reset) {  // once, after the first connect since a watchdog reset
+      static char msg[80];
+      snprintf(msg, sizeof msg, "reset %s", last_reset);
+      publish_event(msg);
+      report_reset = false;
+    }
   } else {
     log_line("mqtt: connect to %s:%u failed (state %d); retrying in %lu s", cfg.broker, cfg.port, mqtt.state(),
              (unsigned long)(mqtt_backoff / 1000));
@@ -551,7 +749,8 @@ bool link_up() { return EthernetMgr.PhyLinkActive(); }
 
 void network_tick() {
   static bool reported_link = true;
-  if (!mqtt_enabled) return;
+  if (!mqtt_enabled || wdt_too_short) return;  // wdt_too_short: see arm_watchdog
+  step(sl::kStepNetwork);
   Ethernet.maintain();
   // DHCP and MQTT connects block while they time out, so only try them with an Ethernet link.
   if (!link_up()) {
@@ -569,6 +768,7 @@ void network_tick() {
     return;
   }
   if (mqtt.connected()) {
+    step(sl::kStepMqttLoop);  // a stalled packet waits the socket timeout (3 s); SD writes kick on their own
     mqtt.loop();
   } else if ((int32_t)(millis() - next_mqtt_try) >= 0) {
     try_mqtt();
@@ -633,6 +833,15 @@ void print_status() {
     log_line("mqtt: disabled");
   }
   log_line("scenes: %u on the SD card%s%s", cfg.scene_count, showing_scene[0] ? ", showing " : "", showing_scene);
+  if (log_dropped) log_line("console: %lu line(s) dropped (a host that didn't read)", (unsigned long)log_dropped);
+  // Before "light:", which tools wait for as the last line.
+  if (!wdt_armed) {
+    log_line("watchdog: off, last reset %s", last_reset);
+  } else {
+    char wdt[200];
+    wdt_describe(wdt, sizeof wdt);
+    log_line("watchdog: %s, last reset %s, %lu early warning(s)", wdt, last_reset, (unsigned long)wdt_warnings);
+  }
   log_line("light: %s", desc);
 }
 
@@ -788,7 +997,13 @@ void strip_loopback_command() {
     log_line("  dma: not available on this port");
     return;
   }
-  while (strip_busy()) continue;
+  const uint32_t waited_from = millis();
+  while (strip_busy()) {
+    if (millis() - waited_from > 100) {  // a frame is 20 ms at most: report a stuck DMA instead of hanging
+      log_line("  dma: the frame didn't finish within 100 ms");
+      return;
+    }
+  }
   uint32_t took_ns = (uint32_t)((uint64_t)(DWT->CYCCNT - start) * 1000000000ULL / SystemCoreClock);
   log_line("  dma: %u-byte frame took %lu us, ideal %lu us (%+ld ns per byte)", (unsigned)frame,
            (unsigned long)(took_ns / 1000), (unsigned long)(ideal_ns / 1000),
@@ -813,18 +1028,32 @@ void strip_index_command(const char* args) {
   }
 }
 
+// SD files are read and written a block at a time, with a step (and kick) in between: a whole settings update
+// takes 4-6 s and only single block operations have time limits, so one kick around it isn't enough.
+const size_t kSdChunk = 512;
+
 // Writes data to a file on the SD card, replacing it, then reads it back to check.
 bool write_file(const char* name, const char* data, size_t len) {
+  step(sl::kStepSdWrite);
   File f = SD.open(name, O_WRITE | O_CREAT | O_TRUNC);
   if (!f) return false;
-  size_t written = f.write((const uint8_t*)data, len);
+  size_t written = 0;
+  while (written < len) {
+    const size_t n = len - written < kSdChunk ? len - written : kSdChunk;
+    const size_t w = f.write((const uint8_t*)data + written, n);
+    step(sl::kStepSdWrite);
+    written += w;
+    if (w != n) break;
+  }
   f.close();
+  step(sl::kStepSdRead);
   if (written != len) return false;
   File r = SD.open(name);
   if (!r) return false;
   size_t i = 0;
   bool same = true;
   while (same && r.available() > 0) {
+    if (i % kSdChunk == 0) step(sl::kStepSdRead);
     int c = r.read();
     same = i < len && c == (uint8_t)data[i];
     i++;
@@ -841,13 +1070,17 @@ bool update_settings_file(const char* const keys[], const char* const values[], 
     log_line("%s: no %s was loaded from the SD card; nothing to update", who, kSettingsFile);
     return false;
   }
+  step(sl::kStepSdRead);
   File f = SD.open(kSettingsFile);
   if (!f) {
     log_line("%s: can't open %s", who, kSettingsFile);
     return false;
   }
   size_t len = 0;
-  while (f.available() > 0 && len < sizeof before) before[len++] = (char)f.read();
+  while (f.available() > 0 && len < sizeof before) {
+    if (len % kSdChunk == 0) step(sl::kStepSdRead);
+    before[len++] = (char)f.read();
+  }
   bool too_big = f.available() > 0;
   f.close();
   if (too_big) {
@@ -863,6 +1096,7 @@ bool update_settings_file(const char* const keys[], const char* const values[], 
     log_line("%s: couldn't write %s; %s not changed", who, kBackupFile, kSettingsFile);
     return false;
   }
+  step(sl::kStepSdWrite);
   if (!write_file(kSettingsFile, after, (size_t)out)) {
     log_line("%s: writing %s failed; the previous version is in %s", who, kSettingsFile, kBackupFile);
     return false;
@@ -932,6 +1166,8 @@ void set_command(const char* args) {
   log_line("set: %s saved to %s (previous copy: %s); type 'reboot' to apply", key, kSettingsFile, kBackupFile);
 }
 
+// Runs at most one command per loop pass, so a pasted batch of "set" lines (an SD write each) never adds up
+// past the watchdog's period between two kicks.
 void console_tick() {
   static char line[640];
   static size_t len = 0;
@@ -946,6 +1182,7 @@ void console_tick() {
     size_t n = len;
     len = 0;
     if (n == 0) continue;
+    step(sl::kStepConsole);
     if (!strcmp(line, "status") || !strcmp(line, "?")) {
       print_status();
     } else if (!strcmp(line, "scenes")) {
@@ -969,43 +1206,71 @@ void console_tick() {
       strip_timing_command(line + 12);
     } else if (!strcmp(line, "reboot")) {
       log_line("reboot: restarting");
-      if (mqtt.connected()) {
-        mqtt.publish(t_status, "offline", true);  // a clean disconnect cancels the Last Will, so say it
-        mqtt.disconnect();
-      }
-      delay(100);
-      SysMgr.ResetBoard();
+      reboot_now();
+    } else if (!strcmp(line, "watchdog_test")) {
+      watchdog_test();
     } else if (!strcmp(line, "help")) {
       log_line("commands: a light command (e.g. GREEN, RED,FAST, IO4=100;IO5=26, STRIP[0-9]=100,0,0, OFF), status,");
       log_line("  set <key> <value> and unset <key> (edit %s), scene <name>, scenes, reboot, help", kSettingsFile);
       log_line("  strip tests: strip_timing [n], strip_raw <hex bytes per pixel>, strip_loopback (pin 5 to 3)");
+      log_line("  watchdog_test: hangs on purpose, so the watchdog resets the board (bench test)");
     } else {
       if (apply_command(line, n, "console")) showing_scene[0] = '\0';
     }
+    return;  // the next command on the next pass
   }
 }
 
 }  // namespace
 
 void setup() {
+  // First the reset cause and the breadcrumb. The crumb counts only after a watchdog reset (after a power-on
+  // backup RAM holds noise, which the check rejects); it is cleared at once so it is reported only this time.
+  const uint8_t cause = Watchdog.lastResetCause();
+  MCLK->AHBMASK.bit.BKUPRAM_ = 1;  // on after every reset; set anyway, the crumb depends on it
+  uint8_t crumb_step = sl::kStepCount;
+  uint32_t crumb_uptime = 0;
+  const bool have_crumb = (cause & sl::kCauseWdt) && sl::crumb_read(crumb(), &crumb_step, &crumb_uptime);
+  sl::crumb_clear(crumb());
+  sl::reset_report(last_reset, sizeof last_reset, cause, have_crumb, crumb_step, crumb_uptime);
+  report_reset = (cause & sl::kCauseWdt) != 0;
+
   Serial.begin(115200);
+  // Always-On, left by earlier firmware, has been counting since the reset: take it over now and kick through
+  // setup. In normal mode it is armed at the end, and the step() calls before that only record the step.
+  if (Watchdog.isAlwaysOn()) arm_watchdog();
   sl::clear(&light);
   load_settings();
+  step(sl::kStepBoot);
   setup_pins();
   setup_strip();
+  step(sl::kStepBoot);
   if (mqtt_enabled) {
     mqtt.setServer(cfg.broker, cfg.port);
     mqtt.setCallback(on_message);
     mqtt.setBufferSize(1200);  // long STRIP commands
+    mqtt.setSocketTimeout(kMqttSocketTimeoutS);
+    eth.setConnectionTimeout(kTcpConnectTimeoutMs);
     EthernetMgr.Setup();  // brings up the PHY so the link can be checked; DHCP waits for a link
     next_net_try = millis();
   }
+  // Armed last: settings and strip setup take well under the period, and nothing before this kicks.
+  if (!wdt_armed) arm_watchdog();
+  if (wdt_always_on) {
+    char wdt[200];
+    wdt_describe(wdt, sizeof wdt);
+    log_line("watchdog: %s", wdt);
+  }
+  if (report_reset) log_line("watchdog: last reset %s", last_reset);
   log_line("ClearCoreStackLight %s ready; type 'help' on this port for commands", kVersion);
 }
 
 void loop() {
+  step(sl::kStepConsole);
   console_tick();
-  network_tick();
+  network_tick();  // records network, dhcp, mqtt-connect and mqtt-loop itself
+  step(sl::kStepButton);
   button_tick();
   update_light();
+  watchdog_tick();
 }

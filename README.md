@@ -14,12 +14,18 @@ Drive a stack light from MQTT with a [Teknic ClearCore](https://www.teknic.com/p
 
 ## Build and flash
 
-The sketch uses the `ClearCore:sam` Arduino core and the [PubSubClient](https://github.com/knolleary/pubsubclient) library:
+The sketch uses the `ClearCore:sam` Arduino core, the [PubSubClient](https://github.com/knolleary/pubsubclient)
+library and [ClearCoreWatchdog](https://github.com/og-buzz/ClearCoreWatchdog) 1.1.0 or later (see
+[Watchdog](#watchdog); until 1.1.0 is released, its `feature/always-on-early-warning` branch):
 
 ```bash
 arduino-cli lib install PubSubClient
+arduino-cli config set library.enable_unsafe_install true   # needed for --git-url
+arduino-cli lib install --git-url https://github.com/og-buzz/ClearCoreWatchdog.git#feature/always-on-early-warning
 arduino-cli compile --fqbn ClearCore:sam:clearcore ClearCoreStackLight
 ```
+
+With a checkout of ClearCoreWatchdog instead, add `--library /path/to/ClearCoreWatchdog` to the compile.
 
 To install the toolchain and flash the board from Linux, WSL2 or Windows, use [teknic-clearcore-cli](https://github.com/og-buzz/teknic-clearcore-cli):
 
@@ -58,7 +64,7 @@ Problems in the file (unknown keys, bad values, two channels on one pin) are pri
 |---|---|---|
 | `…/command` | to the light | A light command (below). Publish it retained, so the light gets it again after a reconnect. |
 | `…/status` | from the light | `online`, or `offline` (retained Last Will) |
-| `…/event` | from the light | `applied <state>`, `rejected <reason>`, `button`, `resetting` |
+| `…/event` | from the light | `applied <state>`, `rejected <reason>`, `button`, `resetting`, `reset watchdog in <step> after <n> s` (or `reset watchdog (no breadcrumb)` when the early warning couldn't run), once after a watchdog reset |
 | `…/reset` | to the light | `RESET` reboots the board, only with `allow_reset=true` |
 | `…/scene` | to the light | A scene name: shows that scene. Publish it not retained |
 | `…/config` | to the light | Only with `allow_config=true`: `scene_<name>=<command>` saves a scene to `settings.ini` and uses it at once, `scene_<name>=` removes it; anything else is rejected. Reported on `…/event` as `config saved …`, `config removed …` or `config rejected …`. Publish it not retained |
@@ -188,13 +194,46 @@ the strip point away from the connection.
 
 ## USB serial console
 
-At 115200 baud the USB port takes the same light commands, plus `status` (settings, network, MQTT and light state; never the password), `set`, `unset`, `scene`, `scenes`, `reboot` and `help`. `set <key> <value>` checks a setting the way `settings.ini` is read and writes it into the file, keeping every other line (the previous version goes to `settings.bak`), e.g. `set strip COM0`; `unset <key>` removes a key's lines; `reboot` applies them. Scenes (`set scene_busy …`, `unset scene_busy`) apply at once. `scene <name>` shows a scene; `scenes` lists the ones on the SD card.
+At 115200 baud the USB port takes the same light commands, plus `status` (settings, network, MQTT, watchdog and light state; never the password), `set`, `unset`, `scene`, `scenes`, `reboot`, `watchdog_test` and `help`. `set <key> <value>` checks a setting the way `settings.ini` is read and writes it into the file, keeping every other line (the previous version goes to `settings.bak`), e.g. `set strip COM0`; `unset <key>` removes a key's lines; `reboot` applies them. Scenes (`set scene_busy …`, `unset scene_busy`) apply at once. `scene <name>` shows a scene; `scenes` lists the ones on the SD card.
 
 For bringing up a new strip: `strip_index` (above); `strip_timing [n]` lists or switches the signal timing until a reboot; `strip_raw <hex>` sends the same raw bytes to every pixel (e.g. `strip_raw 000000ff00` lights only the first white) until the light changes; `strip_loopback`, with a wire from the COM port's pin 5 to pin 3, reads the data line back and times a frame to check the bytes go out without pauses. That makes it possible to test the wiring before the network is set up.
 
+`watchdog_test` hangs the firmware on purpose (it says so first) so the watchdog reset can be tried on the bench:
+the board resets after about 16 s and `status` then shows `last reset watchdog in watchdog-test after <n> s`. It
+exists only on the USB console, never over MQTT.
+
+## Watchdog
+
+The hardware watchdog resets the board when the firmware hangs: 16 s without a kick, in normal mode (not
+Always-On, so flashing and the bootloader are never raced). Every call that can block is bounded below that:
+the MQTT connect (TCP connect 2 s, CONNACK and each stalled packet 3 s, plus 2 s DNS for a broker host name),
+DHCP (5 tries of 1.5 s), settings writes to the SD card (kicked every 512 bytes; a whole write takes 4-6 s), and
+USB console output (a host that keeps the port open but doesn't read loses lines instead of stopping the
+light). The console runs one command per loop pass, and `reboot` and `RESET` no longer wait for the broker
+connection to drain; the broker's Last Will says `offline` as before.
+
+The loop records which step it is in (`console`, `network`, `dhcp`, `mqtt-connect`, `mqtt-loop`, `button`,
+`strip`, `light`, `sd-read`, `sd-write`, `reboot`, `watchdog-test`). The watchdog's early warning, 8 s after the
+last kick, saves that step and the uptime in the SAME53's backup RAM, which a reset keeps. After a watchdog
+reset the light logs it on the USB port, publishes `reset watchdog in mqtt-connect after 3600 s` (for example)
+once on `…/event` when MQTT connects, and `status` shows it on its `watchdog:` line, e.g.
+`watchdog: 16 s, last reset watchdog in mqtt-connect after 3600 s, 0 early warning(s)`. A hang with interrupts
+off gives `watchdog (no breadcrumb)`; other resets show their cause (`power-on`, `software`, `reset pin`, ...).
+An early warning without a reset (a step that took 8-16 s) is logged and counted, and its breadcrumb dropped.
+
+Flashing doesn't clear Always-On: a board that last ran firmware which set it (such as ClearCoreWatchdog's
+`AlwaysOnEarlyWarning` example) keeps that firmware's period and early warning until a power cycle. The light
+then reads them back, kicks from the start of `setup()`, and shows them in `status`, e.g. `watchdog: Always-On
+8 s, early warning at 4 s, locked by earlier firmware until a power cycle; ...`. A period under 12 s leaves no
+margin for DHCP and the MQTT connect, so the light keeps the network off and says to power-cycle it.
+
+The watchdog comes from [ClearCoreWatchdog](https://github.com/og-buzz/ClearCoreWatchdog), which needs its
+early-warning support: the `feature/always-on-early-warning` branch or a release from 1.1.0 on.
+
 ## Tests
 
-The command parser, the blink timing and the settings parser are plain C++ and run on a PC:
+The command parser, the blink timing, the settings parser and the watchdog breadcrumb are plain C++ and run on
+a PC:
 
 ```bash
 make -C test
