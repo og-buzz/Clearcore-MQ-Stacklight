@@ -91,8 +91,49 @@ void defaults(Settings* s) {
   s->allow_reset = false;
 }
 
+// Built-in looks for the Teams states, as status-master's defaults: a scene of the same name replaces one.
+const char* const kStateLooks[][2] = {
+    {"available", "GREEN"}, {"busy", "RED"},  {"call", "RED"},    {"dnd", "RED,SLOW"}, {"away", "YELLOW"},
+    {"brb", "YELLOW,SLOW"}, {"offline", "OFF"}, {"unknown", "OFF"}, {"stale", "OFF"},
+};
+
+bool scene_name_ok(const char* name) {
+  size_t n = strlen(name);
+  if (n == 0 || n > kSceneNameMax) return false;
+  for (size_t i = 0; i < n; i++) {
+    char c = name[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+  }
+  return true;
+}
+
+const char* scene_command(const Settings& s, const char* name) {
+  for (int i = 0; i < s.scene_count; i++)
+    if (!strcmp(s.scenes[i].name, name)) return s.scenes[i].command;
+  for (const auto& look : kStateLooks)
+    if (!strcmp(look[0], name)) return look[1];
+  return nullptr;
+}
+
+bool remove_scene(Settings* s, const char* name) {
+  for (int i = 0; i < s->scene_count; i++) {
+    if (strcmp(s->scenes[i].name, name)) continue;
+    memmove(&s->scenes[i], &s->scenes[i + 1], sizeof s->scenes[0] * (size_t)(s->scene_count - i - 1));
+    s->scene_count--;
+    return true;
+  }
+  return false;
+}
+
+// A topic level or prefix: no MQTT wildcards, no empty levels.
+static bool topic_text_ok(const char* v, bool allow_slash) {
+  if (!*v) return true;
+  if (strpbrk(v, "+#") || v[0] == '/' || v[strlen(v) - 1] == '/' || strstr(v, "//")) return false;
+  return allow_slash || !strchr(v, '/');
+}
+
 bool apply_line(Settings* s, const char* line, char* err, size_t err_cap) {
-  char buf[160];
+  char buf[320];
   size_t n = strlen(line);
   if (n >= sizeof buf) {
     fail(err, err_cap, "line too long", "settings.ini");
@@ -220,6 +261,37 @@ bool apply_line(Settings* s, const char* line, char* err, size_t err_cap) {
   }
   if (!strcmp(key, "allow_reset")) {
     if (!parse_bool(value, &s->allow_reset)) return fail(err, err_cap, "must be true or false", key), false;
+    return true;
+  }
+  if (!strcmp(key, "allow_config")) {
+    if (!parse_bool(value, &s->allow_config)) return fail(err, err_cap, "must be true or false", key), false;
+    return true;
+  }
+  if (!strcmp(key, "owner")) {
+    if (!topic_text_ok(value, false)) return fail(err, err_cap, "one topic level: no '/', '+' or '#'", key), false;
+    return set_text(s->owner, sizeof s->owner, value, key, err, err_cap);
+  }
+  if (!strcmp(key, "presence")) {
+    if (!topic_text_ok(value, true)) return fail(err, err_cap, "a topic prefix like ctms/presence, no '+' or '#'", key), false;
+    return set_text(s->presence, sizeof s->presence, value, key, err, err_cap);
+  }
+  if (!strncmp(key, "scene_", 6)) {
+    const char* name = key + 6;
+    if (!scene_name_ok(name)) return fail(err, err_cap, "scene names are 1..23 of a..z, 0..9, _ and -", key), false;
+    size_t n = strlen(value);
+    if (n == 0) return fail(err, err_cap, "empty (use 'unset' to remove a scene)", key), false;
+    if (n > kSceneCommandMax) return fail(err, err_cap, "the command is over 240 characters", key), false;
+    char why[96];
+    if (!check_command(value, n, why, sizeof why)) return fail(err, err_cap, why, key), false;
+    Scene* sc = nullptr;
+    for (int i = 0; i < s->scene_count && !sc; i++)
+      if (!strcmp(s->scenes[i].name, name)) sc = &s->scenes[i];
+    if (!sc) {
+      if (s->scene_count == kMaxScenes) return fail(err, err_cap, "at most 16 scenes", key), false;
+      sc = &s->scenes[s->scene_count++];
+      strcpy(sc->name, name);
+    }
+    memcpy(sc->command, value, n + 1);
     return true;
   }
   fail(err, err_cap, "unknown setting", key);

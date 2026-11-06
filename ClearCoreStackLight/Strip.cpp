@@ -143,6 +143,21 @@ void strip_effects_reset(StripEffects* fx, uint32_t seed) {
   for (int k = 0; k <= kMaxEffects; k++) effect_reset(&fx->st[k], seed * 2654435761u + (uint32_t)k * 40503u + 1u);
 }
 
+namespace {
+
+// Effects drawn on the physical pixels instead of the layout's positions, so they don't repeat on every leg:
+// SPARKLE's flashes are random along the whole strand.
+bool per_pixel(EffectId id) { return id == kSparkleFx; }
+
+// One pixel's channels (red, green, blue, warm, cool) into wire order.
+void put(uint8_t* o, const uint8_t* c, const uint8_t order[3]) {
+  for (int k = 0; k < 3; k++) o[k] = c[order[k] < 3 ? order[k] : k];
+  o[3] = c[3];
+  o[4] = c[4];
+}
+
+}  // namespace
+
 void strip_render(const State& s, const Timing& t, uint32_t now, const Layout& L, const uint8_t order[3],
                   StripEffects* fx, int pixels, uint8_t* out) {
   static uint8_t pos_col[kStripMaxPixels][kStripChannels];
@@ -174,7 +189,7 @@ void strip_render(const State& s, const Timing& t, uint32_t now, const Layout& L
     for (int k = 0; k < s.fx_count; k++) {
       const EffectSpec& e = s.fx[k];
       const int first = e.first, last = e.last < P - 1 ? e.last : P - 1;
-      if (first > last) continue;
+      if (e.physical || first > last || per_pixel(e.id)) continue;
       effect_render(e, &fx->st[k], last - first + 1, L.wrap && first == 0 && last == P - 1, now, tmp);
       for (int p = first; p <= last; p++)
         if (s.pixel_fx[p] == k + 1) memcpy(pos_col[p], tmp[p - first], kStripChannels);
@@ -188,10 +203,45 @@ void strip_render(const State& s, const Timing& t, uint32_t now, const Layout& L
       memset(o, 0, kStripChannels);
       continue;
     }
-    const uint8_t* c = pos_col[p];
-    for (int k = 0; k < 3; k++) o[k] = c[order[k] < 3 ? order[k] : k];
-    o[3] = c[3];
-    o[4] = c[4];
+    put(o, pos_col[p], order);
+  }
+  // Per-pixel effects: over every physical pixel whose position the effect still owns (later items keep theirs).
+  for (int k = 0; s.strip_set && k < s.fx_count; k++) {
+    const EffectSpec& e = s.fx[k];
+    if (e.physical || !per_pixel(e.id)) continue;
+    static int16_t idx[kStripMaxPixels];
+    int m = 0;
+    for (int i = 0; i < pixels; i++) {
+      const int p = L.pos[i];
+      if (p >= e.first && p <= e.last && p < P && s.pixel_fx[p] == k + 1) idx[m++] = (int16_t)i;
+    }
+    if (!m) continue;
+    effect_render(e, &fx->st[k], m, false, now, tmp);
+    for (int j = 0; j < m; j++) put(out + (size_t)idx[j] * kStripChannels, tmp[j], order);
+  }
+  if (!s.strip_set) return;
+  // PIX items: physical pixels, over everything above. Levels first, then effects from their first pixel to their
+  // last (either way along the strand), over the pixels they still own.
+  for (int i = 0; i < pixels; i++) {
+    if (!s.px_set[i] || s.px_fx[i]) continue;
+    uint8_t c[kStripChannels];
+    const bool on = blink(s.px_mode[i], t, now);
+    for (int ch = 0; ch < kStripChannels; ch++) c[ch] = on ? level_duty(s.px[i][ch]) : 0;
+    put(out + (size_t)i * kStripChannels, c, order);
+  }
+  for (int k = 0; k < s.fx_count; k++) {
+    const EffectSpec& e = s.fx[k];
+    if (!e.physical) continue;
+    static int16_t idx[kStripMaxPixels];
+    int m = 0;
+    const int step = e.first <= e.last ? 1 : -1;
+    for (int p = e.first;; p += step) {
+      if (p < pixels && s.px_fx[p] == k + 1) idx[m++] = (int16_t)p;
+      if (p == e.last) break;
+    }
+    if (!m) continue;
+    effect_render(e, &fx->st[k], m, false, now, tmp);
+    for (int j = 0; j < m; j++) put(out + (size_t)idx[j] * kStripChannels, tmp[j], order);
   }
 }
 

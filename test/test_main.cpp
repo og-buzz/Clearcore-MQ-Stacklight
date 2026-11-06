@@ -458,6 +458,28 @@ static void test_strip() {
     strip_render(st, t, 0, fold, rgb, &fx, 50, px);
     CHECK(pix(0)[0] == 255 && pix(49)[0] == 255 && pix(24)[2] == 255 && pix(25)[2] == 255 && pix(10)[0] == 0);
 
+    // SPARKLE flashes physical pixels, random along the whole strand rather than mirrored on both legs, and
+    // leaves the pixels of later items (a status pixel) alone.
+    parse("STRIP=SPARKLE,0/0/0/0/40,0/0/0/3/0;STRIP[12]=0,5,0", &st);
+    strip_effects_reset(&fx, 3);
+    int mirrored = 0, flashes = 0, legs[2] = {0, 0};
+    for (uint32_t ms = 0; ms <= 20000; ms += 40) {
+      strip_render(st, t, ms, fold, rgb, &fx, 50, px);
+      CHECK(pix(12)[1] == level_duty(50) && pix(37)[1] == level_duty(50) && pix(12)[4] == 0 && pix(37)[4] == 0);
+      for (int i = 0; i < 50; i++) {
+        if (pix(i)[4] != 102) {
+          CHECK(i == 12 || i == 37 || (pix(i)[3] == 8 && pix(i)[4] == 0));
+          continue;
+        }
+        flashes++;
+        legs[i >= 25]++;
+        mirrored += pix(49 - i)[4] == 102;
+      }
+    }
+    CHECK(flashes >= 480 && flashes <= 520);  // 25 a second for 20 s
+    CHECK(legs[0] > 150 && legs[1] > 150);    // both legs, independently
+    CHECK(mirrored < 10);                     // not in pairs
+
     // Layout maps.
     static Layout L;
     CHECK(layout_parse("0-24|49-25", 50, &L, lerr, sizeof lerr) && L.positions == 25 && L.pos[49] == 0 && L.pos[25] == 24);
@@ -622,6 +644,260 @@ static void test_effects() {
   CHECK(gold[1] > red[1] && gold[0] == red[0]);
 }
 
+// RAMP: IO pins and strip effects rise from one level to another, drop straight back, and stay in step.
+static void test_ramp() {
+  static State s;
+  CHECK(parse("IO4=RAMP,50,100,1250MS", &s) && s.io_set[4] && s.io[4].wave == kWaveRamp && s.io[4].from == 500 &&
+        s.io[4].level == 1000 && s.io[4].ms == 1250 && s.io[4].speed == 1);
+  CHECK(parse("io5 = ramp , 40", &s) && s.io[5].wave == kWaveRamp && s.io[5].from == 0 && s.io[5].level == 400 &&
+        s.io[5].ms == 0);
+  CHECK(parse("IO5=RAMP,40,FAST", &s) && s.io[5].speed == 2);
+  CHECK(parse("IO5=RAMP,40;IO5=40", &s) && s.io[5].wave == kSteady && s.io[5].level == 400);  // a later item wins
+  CHECK(ramp_period(1, 0) == 2000 && ramp_period(0, 0) == 4000 && ramp_period(2, 0) == 1000);
+  CHECK(ramp_period(2, 1250) == 1250);
+  CHECK(ramp_level(20, 60, 1250, 0) == 20 && ramp_level(20, 60, 1250, 625) == 40);
+  CHECK(ramp_level(20, 60, 1250, 1249) == 59 && ramp_level(20, 60, 1250, 1250) == 20);  // straight back down
+  CHECK(ramp_level(20, 60, 1250, 2500 + 625) == 40 && ramp_level(100, 0, 1000, 500) == 50);
+
+  // IO duty follows the ramp, 50 % .. 100 %.
+  const int8_t pins[kChannels] = {4, 5, -1, -1};
+  const Timing t = {250, 250, 1000, 1000};
+  uint8_t duty[kIoPins];
+  CHECK(parse("IO4=RAMP,50,100,1250MS", &s));
+  io_duty(s, t, 0, pins, duty);
+  CHECK(duty[4] == level_duty(500) && duty[5] == 0);
+  io_duty(s, t, 625, pins, duty);
+  CHECK(duty[4] == level_duty(750));
+  io_duty(s, t, 1249, pins, duty);
+  CHECK(duty[4] >= 254);
+  io_duty(s, t, 1250, pins, duty);
+  CHECK(duty[4] == level_duty(500));
+
+  // The status-master DND command: the strip pixel ramps 2 % .. 6 % red in step with IO4.
+  static EffectState es;
+  uint8_t px[1][kEffectChannels];
+  const char* dnd = "IO4=RAMP,50,100,1250MS;STRIP=0,0,0,3,0;STRIP[12]=RAMP,2/0/0,6/0/0,1250MS";
+  CHECK(parse(dnd, &s) && s.fx_count == 1 && s.fx[0].id == kRampFx && s.fx[0].ms == 1250 && s.fx[0].ncolors == 2);
+  CHECK(s.pixel_fx[12] == 1 && s.pixel_fx[11] == 0 && s.pixel[11][3] == 30);
+  const struct { uint32_t ms; uint8_t red, io; } steps[] = {
+      {0, 5, 128}, {625, 10, 191}, {1250, 5, 128}, {100000 + 625, 10, 191}};  // 2 % = 5.1, 4 % = 10.2 of 255
+  for (const auto& st : steps) {
+    effect_render(s.fx[0], &es, 1, false, st.ms, px);
+    io_duty(s, t, st.ms, pins, duty);
+    if (px[0][0] != st.red || duty[4] != st.io)
+      fprintf(stderr, "ramp at %u ms: red %u (want %u), IO4 %u (want %u)\n", (unsigned)st.ms, px[0][0], st.red,
+              duty[4], st.io);
+    CHECK(px[0][0] == st.red && px[0][1] == 0 && px[0][3] == 0 && duty[4] == st.io);
+  }
+  effect_render(s.fx[0], &es, 1, false, 1249, px);
+  CHECK(px[0][0] == 15);  // 6 % = 15.3 just before the drop
+  // One colour ramps up from dark.
+  CHECK(parse("STRIP=RAMP,RED", &s) && s.fx[0].ncolors == 1);
+  effect_render(s.fx[0], &es, 1, false, 0, px);
+  CHECK(px[0][0] == 0);
+  effect_render(s.fx[0], &es, 1, false, 1000, px);
+  CHECK(px[0][0] == 128);
+
+  desc_is("io4=ramp,50,100,1250ms", "IO4=RAMP,50,100,1250MS");
+  desc_is("IO5=RAMP,40,SLOW", "IO5=RAMP,0,40,SLOW");
+  desc_is("IO5=RAMP,27.5,40,FAST,100MS", "IO5=RAMP,27.5,40,FAST,100MS");
+  desc_is(dnd, "IO4=RAMP,50,100,1250MS;STRIP[0-11]=0,0,0,3,0;STRIP[12]=RAMP,1250MS,2/0/0/0/0,6/0/0/0/0;"
+               "STRIP[13-299]=0,0,0,3,0");
+
+  static State before;
+  parse("BLUE,SLOW;IO5=26", &before);
+  s = before;
+  char err[96];
+  for (const char* bad : {"IO4=RAMP", "IO4=RAMP,", "IO4=RAMP,1,2,3", "IO4=RAMP,50,100,OFF", "IO4=RAMP,50,100,99MS",
+                          "IO4=RAMP,50,100,60001MS", "IO4=RAMP,50,1250", "IO4=RAMPS,50", "IO4=50,RAMP",
+                          "IO4=RAMP,50,100,1250 MS", "STRIP=RAMP,50MS", "STRIP=RAMP,1.5MS", "STRIP=RAMP,MS"}) {
+    bool rejected = !parse_command(bad, strlen(bad), &s, err, sizeof err);
+    if (!rejected) fprintf(stderr, "accepted bad command %s\n", bad);
+    CHECK(rejected);
+  }
+  CHECK(memcmp(&s, &before, sizeof s) == 0);
+}
+
+// SPARKLE: random positions flash for exactly one render (one frame), at the rate asked, over a background.
+static void test_sparkle() {
+  static State s;
+  static EffectState es;
+  static uint8_t out[20][kEffectChannels];
+  CHECK(parse("STRIP=SPARKLE,0/0/0/0/40,0/0/0/3/0", &s) && s.fx[0].id == kSparkleFx && s.fx[0].ncolors == 2);
+  effect_reset(&es, 7);
+  auto flashes = [&](uint32_t now) {
+    effect_render(s.fx[0], &es, 20, false, now, out);
+    int lit = 0;
+    for (int p = 0; p < 20; p++) {
+      if (out[p][4] == 102) lit++;  // 40 % cool white
+      else CHECK(out[p][4] == 0 && out[p][3] == 8);  // the 3 % warm white background
+    }
+    return lit;
+  };
+  CHECK(flashes(1000) == 0);  // the first render starts the clock
+  CHECK(flashes(1040) == 1);  // 25 a second: one per 40 ms
+  CHECK(flashes(1040) == 0);  // a flash lasts one render, and the same moment adds none
+  CHECK(flashes(1060) == 0 && flashes(1080) == 1);
+  int total = 0;
+  for (uint32_t ms = 1082; ms <= 2080; ms += 2) total += flashes(ms);  // renders every 2 ms, like the strip
+  CHECK(total >= 24 && total <= 26);
+  CHECK(parse("STRIP=SPARKLE,FAST", &s) && s.fx[0].speed == 2);
+  effect_reset(&es, 7);
+  effect_render(s.fx[0], &es, 20, false, 0, out);
+  effect_render(s.fx[0], &es, 20, false, 40, out);
+  int fast = 0;
+  for (int p = 0; p < 20; p++) fast += out[p][4] == 255;
+  CHECK(fast == 2);  // 50 a second: two in 40 ms (on different positions with this seed)
+  desc_is("strip=sparkle,0/0/0/0/40,30hz", "STRIP=SPARKLE,30HZ,0/0/0/0/40");
+}
+
+// PULSE: eases up and back down on a cosine, the whole cycle in one period, in step on the strip and IO pins.
+static void test_pulse() {
+  static State s;
+  CHECK(pulse_level(500, 1000, 6000, 0) == 500 && pulse_level(500, 1000, 6000, 1500) == 750);
+  CHECK(pulse_level(500, 1000, 6000, 3000) == 1000 && pulse_level(500, 1000, 6000, 4500) == 750);
+  CHECK(pulse_level(500, 1000, 6000, 6000) == 500 && pulse_level(500, 1000, 6000, 60000 + 3000) == 1000);
+  // Smooth: no step bigger than a small slice of the range anywhere, including where RAMP would drop.
+  int worst = 0;
+  for (uint32_t ms = 0; ms < 12000; ms += 10) {
+    int d = abs((int)pulse_level(500, 1000, 6000, ms + 10) - (int)pulse_level(500, 1000, 6000, ms));
+    if (d > worst) worst = d;
+  }
+  CHECK(worst <= 3);
+
+  const char* brb =
+      "IO4=PULSE,50,100,6000MS;IO5=PULSE,13,26,6000MS;STRIP=0,0,0,3,0;STRIP[12]=PULSE,1/0.4/0,5/2/0,6000MS";
+  CHECK(parse(brb, &s) && s.io[4].wave == kWavePulse && s.io[5].wave == kWavePulse && s.io[5].from == 130);
+  CHECK(s.fx_count == 1 && s.fx[0].id == kPulseFx && s.fx[0].ms == 6000 && s.pixel_fx[12] == 1);
+  const int8_t pins[kChannels] = {4, 5, -1, -1};
+  const Timing t = {250, 250, 1000, 1000};
+  uint8_t duty[kIoPins];
+  static EffectState es;
+  uint8_t px[1][kEffectChannels];
+  // Yellow keeps its 100:26 mix on the stack light all the way, and the pixel peaks with it.
+  for (uint32_t ms : {0u, 1500u, 3000u, 4500u}) {
+    io_duty(s, t, ms, pins, duty);
+    CHECK(abs(duty[5] * 100 - duty[4] * 26) <= 100);
+  }
+  io_duty(s, t, 3000, pins, duty);
+  effect_render(s.fx[0], &es, 1, false, 3000, px);
+  CHECK(duty[4] == 255 && duty[5] == level_duty(260) && px[0][0] == 13 && px[0][1] == 5);  // 5 %, 2 % of 255
+  io_duty(s, t, 6000, pins, duty);
+  effect_render(s.fx[0], &es, 1, false, 6000, px);
+  CHECK(duty[4] == level_duty(500) && px[0][0] == 3 && px[0][1] == 1);  // back at 1 %, 0.4 %
+
+  desc_is("io4=pulse,50,100,6000ms", "IO4=PULSE,50,100,6000MS");
+  desc_is("IO5=PULSE,40,SLOW", "IO5=PULSE,0,40,SLOW");
+  desc_is("STRIP[12]=PULSE,1/0.4/0,5/2/0,6000MS", "STRIP[12]=PULSE,6000MS,1/0.4/0/0/0,5/2/0/0/0");
+  char err[96];
+  for (const char* bad : {"IO4=PULSE", "IO4=PULSE,1,2,3", "IO4=PULSES,50", "IO4=PULSE,50,100,OFF", "STRIP=PULSE,50MS"})
+    CHECK(!parse_command(bad, strlen(bad), &s, err, sizeof err));
+}
+
+// PIX: physical pixels over the layout, either way along the strand.
+static void test_pix() {
+  static State s;
+  CHECK(parse("PIX[12]=0,5,0", &s) && s.strip_set && s.px_set[12] && s.px[12][1] == 50 && !s.px_set[11]);
+  CHECK(s.pixel[12][1] == 0 && s.pixel_fx[12] == 0);  // positions untouched
+  CHECK(parse("PIX[38-20]=FIRE,FAST", &s) && s.fx_count == 1 && s.fx[0].physical && s.fx[0].first == 38 &&
+        s.fx[0].last == 20 && s.px_fx[20] == 1 && s.px_fx[38] == 1 && s.px_fx[19] == 0 && s.px_fx[39] == 0);
+  CHECK(parse("PIX[5-3]=1,2,3", &s) && s.px_set[3] && s.px_set[5]);
+  CHECK(!parse("STRIP[5-3]=1,2,3", &s));  // positions still run forwards
+  CHECK(!parse("PIX[300]=1,2,3", &s) && !parse("PIXEL[1]=1,2,3", &s) && !parse("PIX[1]x=1,2,3", &s));
+  desc_is("STRIP=0,0,0,3,0;PIX[12]=0,5,0;PIX[26]=0,5,0", "STRIP=0,0,0,3,0;PIX[12]=0,5,0,0,0;PIX[26]=0,5,0,0,0");
+  desc_is("pix[38-20]=fire,fast", "PIX[38-20]=FIRE,FAST");
+  desc_is("PIX[3]=0,0,0", "PIX[3]=0,0,0,0,0");  // a dark PIX still covers the layout
+  desc_is("IO4=100;PIX[12]=RAMP,2/0/0,6/0/0,1250MS", "IO4=100;PIX[12]=RAMP,1250MS,2/0/0/0/0,6/0/0/0/0");
+
+  static StripEffects fx;
+  static Layout fold, line;
+  char lerr[96];
+  CHECK(layout_parse("fold", 50, &fold, lerr, sizeof lerr) && layout_parse("line", 50, &line, lerr, sizeof lerr));
+  const Timing t = {350, 150, 750, 250};
+  const uint8_t rgb[3] = {0, 1, 2};
+  static uint8_t px[50 * kStripChannels], fwd[50 * kStripChannels];
+  auto pix = [&](uint8_t* b, int i) { return b + i * kStripChannels; };
+  strip_effects_reset(&fx, 1);
+  // On a fold, STRIP[3] is pixels 3 and 46; PIX[3] takes pixel 3 alone.
+  CHECK(parse("STRIP[3]=100,0,0;PIX[3]=0,0,100", &s));
+  strip_render(s, t, 0, fold, rgb, &fx, 50, px);
+  CHECK(pix(px, 3)[2] == 255 && pix(px, 3)[0] == 0 && pix(px, 46)[0] == 255 && pix(px, 46)[2] == 0);
+  // PIX is over STRIP whatever the order, and only pixels it names.
+  CHECK(parse("PIX[3]=0,100,0;STRIP=0,0,0,100,0", &s));
+  strip_render(s, t, 0, line, rgb, &fx, 50, px);
+  CHECK(pix(px, 3)[1] == 255 && pix(px, 3)[3] == 0 && pix(px, 4)[3] == 255);
+  // PIX blinks in its mode.
+  CHECK(parse("PIX[7]=100,0,0,SLOW", &s));
+  strip_render(s, t, 800, line, rgb, &fx, 50, px);
+  CHECK(pix(px, 7)[0] == 0);
+  strip_render(s, t, 100, line, rgb, &fx, 50, px);
+  CHECK(pix(px, 7)[0] == 255);
+  // A backwards effect is the forwards one mirrored.
+  for (uint32_t ms : {300u, 900u, 1700u}) {
+    CHECK(parse("PIX[0-9]=WIPE,RED", &s));
+    strip_effects_reset(&fx, 5);
+    strip_render(s, t, ms, line, rgb, &fx, 50, fwd);
+    CHECK(parse("PIX[9-0]=WIPE,RED", &s));
+    strip_effects_reset(&fx, 5);
+    strip_render(s, t, ms, line, rgb, &fx, 50, px);
+    bool mirrored = true, differs = false;
+    for (int i = 0; i < 10; i++) {
+      mirrored = mirrored && !memcmp(pix(px, i), pix(fwd, 9 - i), kStripChannels);
+      differs = differs || memcmp(pix(px, i), pix(fwd, i), kStripChannels);
+    }
+    CHECK(mirrored);
+    if (ms == 900) CHECK(differs);  // half way through the wipe the two directions differ
+  }
+  // Pixels past the strip are ignored.
+  CHECK(parse("PIX[60]=100,0,0", &s));
+  strip_render(s, t, 0, line, rgb, &fx, 50, px);
+}
+
+// Scenes, owner and presence in settings.ini.
+static void test_scenes() {
+  static Settings s;
+  char err[96];
+  defaults(&s);
+  CHECK(apply_line(&s, "scene_busy=IO4=100;STRIP=0,0,0,3,0;PIX[12]=5,0,0", err, sizeof err));
+  CHECK(s.scene_count == 1 && !strcmp(scene_command(s, "busy"), "IO4=100;STRIP=0,0,0,3,0;PIX[12]=5,0,0"));
+  CHECK(apply_line(&s, "scene_busy = RED,FAST  # replaces it", err, sizeof err) && s.scene_count == 1);
+  CHECK(!strcmp(scene_command(s, "busy"), "RED,FAST"));
+  CHECK(!strcmp(scene_command(s, "dnd"), "RED,SLOW") && !strcmp(scene_command(s, "stale"), "OFF"));  // built in
+  CHECK(scene_command(s, "focus") == nullptr);
+  CHECK(apply_line(&s, "scene_focus-2=STRIP=SPARKLE,0/0/0/0/40", err, sizeof err) && scene_command(s, "focus-2"));
+  for (const char* bad : {"scene_Busy=RED", "scene_=RED", "scene_x=PURPLE", "scene_x=", "scene_a.b=RED",
+                          "scene_abcdefghijklmnopqrstuvwx=RED"}) {
+    bool rejected = !apply_line(&s, bad, err, sizeof err);
+    if (!rejected) fprintf(stderr, "accepted %s\n", bad);
+    CHECK(rejected);
+  }
+  char longer[300];
+  snprintf(longer, sizeof longer, "scene_long=%s", "STRIP=0,0,0,3,0;" "STRIP=0,0,0,3,0;" "STRIP=0,0,0,3,0;"
+           "STRIP=0,0,0,3,0;" "STRIP=0,0,0,3,0;" "STRIP=0,0,0,3,0;" "STRIP=0,0,0,3,0;" "STRIP=0,0,0,3,0;"
+           "STRIP=0,0,0,3,0;" "STRIP=0,0,0,3,0;" "STRIP=0,0,0,3,0;" "STRIP=0,0,0,3,0;" "STRIP=0,0,0,3,0;"
+           "STRIP=0,0,0,3,0;" "STRIP=0,0,0,3,0;" "STRIP=0,0,0,3,0");
+  CHECK(!apply_line(&s, longer, err, sizeof err) && strstr(err, "240"));
+  for (int i = s.scene_count; i < kMaxScenes; i++) {
+    char line[48];
+    snprintf(line, sizeof line, "scene_s%d=GREEN", i);
+    CHECK(apply_line(&s, line, err, sizeof err));
+  }
+  CHECK(!apply_line(&s, "scene_one_more=GREEN", err, sizeof err) && strstr(err, "16"));
+  CHECK(remove_scene(&s, "busy") && s.scene_count == kMaxScenes - 1 && !strcmp(scene_command(s, "busy"), "RED"));
+  CHECK(!remove_scene(&s, "busy"));
+
+  CHECK(!follows_presence(s));
+  CHECK(apply_line(&s, "owner=ann@example.com", err, sizeof err) && !follows_presence(s));
+  CHECK(apply_line(&s, "presence=ctms/presence", err, sizeof err) && follows_presence(s));
+  for (const char* bad : {"owner=a/b", "owner=a+b", "presence=ctms/#", "presence=/ctms", "presence=ctms//p",
+                          "allow_config=maybe"}) {
+    bool rejected = !apply_line(&s, bad, err, sizeof err);
+    if (!rejected) fprintf(stderr, "accepted %s\n", bad);
+    CHECK(rejected);
+  }
+  CHECK(!s.allow_config && apply_line(&s, "allow_config=true", err, sizeof err) && s.allow_config);
+}
+
 int main() {
   test_commands();
   test_blink();
@@ -631,6 +907,11 @@ int main() {
   test_set_keys();
   test_strip();
   test_effects();
+  test_ramp();
+  test_sparkle();
+  test_pulse();
+  test_pix();
+  test_scenes();
   if (failures) {
     fprintf(stderr, "%d check(s) failed\n", failures);
     return 1;

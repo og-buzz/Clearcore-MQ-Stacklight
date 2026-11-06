@@ -42,6 +42,9 @@ Copy [`settings.example.ini`](settings.example.ini) to the root of the microSD c
 | `button` | Input for a push button: `IO0`..`IO5`, `DI6`..`DI8` or `none` |
 | `fast_on`, `fast_off`, `slow_on`, `slow_off` | Blink timing in milliseconds |
 | `allow_reset` | `true` to allow a reboot over MQTT (default `false`) |
+| `scene_<name>` | A named light command (at most 16, 240 characters each), e.g. `scene_busy=IO4=100;STRIP=0,0,0,3,0;PIX[12]=5,0,0`. The Teams states `available`, `busy`, `call`, `dnd`, `away`, `brb`, `offline`, `unknown` and `stale` have built-in looks (`GREEN`, `RED`, `RED`, `RED,SLOW`, `YELLOW`, `YELLOW,SLOW`, `OFF`, `OFF`, `OFF`) that a scene of the same name replaces |
+| `owner`, `presence` | Follow a person: with both set, the light subscribes to `<presence>/<owner>` and shows the scene named by each state published there, and the `stale` scene while `<presence>/publisher` is `offline` |
+| `allow_config` | `true` to accept `scene_*` settings on `…/config` (default `false`) |
 | `strip`, `strip_pixels` | A WS2805 strip on `COM0` or `COM1` with this many pixels (default `none`) |
 | `strip_order` | Colour order on the wire: `RGB` (default, WS2805 datasheet), `GRB` (BTF's WS2805 strip), or any other order of R, G and B |
 | `strip_timing` | Signal timing `0`..`5` (default `4`, see below) |
@@ -57,8 +60,12 @@ Problems in the file (unknown keys, bad values, two channels on one pin) are pri
 | `…/status` | from the light | `online`, or `offline` (retained Last Will) |
 | `…/event` | from the light | `applied <state>`, `rejected <reason>`, `button`, `resetting` |
 | `…/reset` | to the light | `RESET` reboots the board, only with `allow_reset=true` |
+| `…/scene` | to the light | A scene name: shows that scene. Publish it not retained |
+| `…/config` | to the light | Only with `allow_config=true`: `scene_<name>=<command>` saves a scene to `settings.ini` and uses it at once, `scene_<name>=` removes it; anything else is rejected. Reported on `…/event` as `config saved …`, `config removed …` or `config rejected …`. Publish it not retained |
+| `<presence>/<owner>` | to the light | With `owner` and `presence` set: a Teams state (`busy`, `dnd`, …), shown as the scene of that name |
+| `<presence>/publisher` | to the light | `online`, or `offline` (the publisher's Last Will): shows the `stale` scene until it is back |
 
-A retained `RESET` would reboot the board on every reconnect, so the light ignores a reset that arrives right after it subscribes and clears it from the broker.
+A retained `RESET` would reboot the board on every reconnect, so the light ignores a reset that arrives right after it subscribes and clears it from the broker. Retained `…/scene` and `…/config` messages are ignored the same way, and a light that follows presence ignores the retained `…/command` too, taking its state from the presence topic instead.
 
 ## Light commands
 
@@ -69,9 +76,12 @@ command, so the publisher decides the colours.
 |---|---|
 | `NAME[,MODE]` | `RED`, `GREEN`, `BLUE`, `YELLOW` and `ORANGE` (red + green), `MAGENTA`, `CYAN`, `WHITE` and `ALL` (red + green + blue), `ALARM`, `FIRE` (red and yellow alternating, alarm fast), `OFF` (clears everything). Lights the pins `settings.ini` names for those channels at full brightness, and the whole strip unless a `STRIP` item is given |
 | `IOn=PERCENT[,MODE]` | Light output `IO0`..`IO5` at `0`..`100` % (one decimal), e.g. `IO5=26`. Overrides the names for that pin; only pins named in `settings.ini` (`red=`, `green=`, `blue=`, `alarm=`) are accepted |
+| `IOn=RAMP,[FROM,]TO[,SPEED][,NNNMS]` | The output rises evenly from `FROM` % (default 0) to `TO` %, then drops straight back: 2 s a rise (`SLOW` 4, `FAST` 1), or a period in ms, e.g. `IO4=RAMP,50,100,1250MS`. In step with `RAMP` strip effects of the same period |
+| `IOn=PULSE,[FROM,]TO[,SPEED][,NNNMS]` | The output eases up from `FROM` % to `TO` % and back down on a cosine, no hard edges; the period is the whole cycle, e.g. `IO4=PULSE,50,100,6000MS`. In step with `PULSE` strip effects of the same period |
 | `STRIP=R,G,B[,WW,CW][,MODE]` | Every pixel: red, green, blue, warm white, cool white in percent |
 | `STRIP[n]=…`, `STRIP[a-b]=…` | Pixel `n`, or pixels `a`..`b` (0 = the end at the ClearCore). With any `STRIP` item the strip starts dark and the items paint it in order |
-| `STRIP=EFFECT[,options]`, `STRIP[a-b]=EFFECT…` | An effect over the range (see [Strip effects](#strip-effects)). Options, in any order: a speed `SLOW`, `ON` (normal) or `FAST`; up to two colours, names (`RED`, `ORANGE`, `AMBER`, `YELLOW`, `GREEN`, `CYAN`, `BLUE`, `PURPLE`, `MAGENTA`, `PINK`, `WARM`, `COOL`, `WHITE`) or percents `r/g/b[/ww/cw]`; a dimmer, a plain percent (`40`); a colour temperature for the white lights (`4000K`); a rate for the flashers and the strobe (`25HZ`). Up to 8 effects in one command. Without `STRIP` items, the `FIRE` name burns the whole strip |
+| `PIX=…`, `PIX[n]=…`, `PIX[a-b]=…` | The same values as `STRIP` (levels and a mode, or an effect), on **physical** pixels (0 = the first after the ClearCore) whatever `strip_layout` says, over the `STRIP` items. A range may run backwards, `PIX[38-20]=FIRE`, so an effect runs either way along the strand. `strip_layout` shapes how effects flow; `PIX` picks out pixels |
+| `STRIP=EFFECT[,options]`, `STRIP[a-b]=EFFECT…` | An effect over the range (see [Strip effects](#strip-effects)). Options, in any order: a speed `SLOW`, `ON` (normal) or `FAST`; up to two colours, names (`RED`, `ORANGE`, `AMBER`, `YELLOW`, `GREEN`, `CYAN`, `BLUE`, `PURPLE`, `MAGENTA`, `PINK`, `WARM`, `COOL`, `WHITE`) or percents `r/g/b[/ww/cw]`; a dimmer, a plain percent (`40`); a colour temperature for the white lights (`4000K`); a rate for the flashers and the strobe (`25HZ`); a period for `RAMP` and `PULSE` (`1250MS`, 100..60000). Up to 8 effects in one command. Without `STRIP` items, the `FIRE` name burns the whole strip |
 
 Modes: `ON` (default), `OFF`, `SLOW`, `FAST`; everything in the same mode blinks in step. Case doesn't matter.
 An invalid command is rejected (reported on the event topic) and the light keeps its state.
@@ -110,6 +120,7 @@ The 2024 payloads such as `RED,ON` and `ALL,OFF` still work, with one change: ea
 | | `DISCO` | Blocks of random colours on the beat (120 bpm), mirror-ball sparkles | – |
 | | `STROBE` | White flashes, 10 Hz (SLOW 4, FAST 20, or any rate up to 60 with `NNHZ`), 30 ms each, shorter above 13 Hz | white |
 | | `CONFETTI` | Random coloured sparks fading out | – |
+| | `SPARKLE` | Random pixels flash for a single frame (about 2 ms on a short strip) over the second colour, random along the whole strand whatever the layout (not mirrored on its legs): 25 a second over the range (SLOW 10, FAST 50, or `NNHZ`); `STRIP=SPARKLE,0/0/0/0/40` | cool white, off |
 | Colour motion | `RAINBOW` | A rainbow scrolling along the range | – |
 | | `PLASMA` | Psychedelic interference colours | – |
 | | `COMET` | A comet with a fading tail, again and again (on a ring, round) | cyan-white |
@@ -121,6 +132,8 @@ The 2024 payloads such as `RED,ON` and `ALL,OFF` still work, with one change: ea
 | | `TWINKLE` | Soft twinkles on a dim background | warm white, dim warm |
 | | `FIREPLACE` | `FIRE`, calm: slow low embers at half brightness over a warm glow, never white-hot | – |
 | | `LAKE` | `WATER`, calm: a slow swell, deeper and dimmer, the odd glint | – |
+| | `RAMP` | Rises evenly from the first colour to the second (from dark with one colour), then drops straight back: 2 s (SLOW 4, FAST 1) or `NNNMS`. The phase follows the clock, so ramps with the same period, on the strip and on `IOn=RAMP` outputs, rise and drop together | warm white |
+| | `PULSE` | Eases from the first colour to the second and back on a cosine (from dark with one colour), the whole cycle in 2 s (SLOW 4, FAST 1) or `NNNMS`; in step with `IOn=PULSE` outputs of the same period | warm white |
 | Warning lights | `POLICE` | Sides alternating, a double flash each: 120 flashes a minute per side (SLOW 60, FAST 240) | red, blue |
 | | `WIGWAG` | Sides alternating, one flash each: 75 a minute per side (SLOW 60, FAST 120) | red, blue |
 | | `QUAD` | Sides alternating, four quick flashes each, 60 cycles a minute (SLOW 30, FAST 120) | red, blue |
@@ -135,6 +148,7 @@ mosquitto_pub -h <broker> -t $T -r -m 'STRIP[0-12]=WATER;STRIP[13-24]=FIRE'
 mosquitto_pub -h <broker> -t $T -r -m 'STRIP=WARMLIGHT,20;STRIP[24-25]=LASER,FAST,GREEN'
 mosquitto_pub -h <broker> -t $T -r -m 'STRIP=LIGHT,4000K,60'                       # desk light, dimmed
 mosquitto_pub -h <broker> -t $T -r -m 'STRIP=QUAD,RED,WHITE'                       # fire-engine colours
+mosquitto_pub -h <broker> -t $T -r -m 'IO4=RAMP,50,100,1250MS;STRIP[12]=RAMP,2/0/0,6/0/0,1250MS'  # in step
 ```
 
 The flash rates follow published guidance where there is some: `BEACON` keeps to the MUTCD's flashing beacon
@@ -174,7 +188,7 @@ the strip point away from the connection.
 
 ## USB serial console
 
-At 115200 baud the USB port takes the same light commands, plus `status` (settings, network, MQTT and light state; never the password), `set`, `unset`, `reboot` and `help`. `set <key> <value>` checks a setting the way `settings.ini` is read and writes it into the file, keeping every other line (the previous version goes to `settings.bak`), e.g. `set strip COM0`; `unset <key>` removes a key's lines; `reboot` applies them.
+At 115200 baud the USB port takes the same light commands, plus `status` (settings, network, MQTT and light state; never the password), `set`, `unset`, `scene`, `scenes`, `reboot` and `help`. `set <key> <value>` checks a setting the way `settings.ini` is read and writes it into the file, keeping every other line (the previous version goes to `settings.bak`), e.g. `set strip COM0`; `unset <key>` removes a key's lines; `reboot` applies them. Scenes (`set scene_busy …`, `unset scene_busy`) apply at once. `scene <name>` shows a scene; `scenes` lists the ones on the SD card.
 
 For bringing up a new strip: `strip_index` (above); `strip_timing [n]` lists or switches the signal timing until a reboot; `strip_raw <hex>` sends the same raw bytes to every pixel (e.g. `strip_raw 000000ff00` lights only the first white) until the light changes; `strip_loopback`, with a wire from the COM port's pin 5 to pin 3, reads the data line back and times a frame to check the bytes go out without pauses. That makes it possible to test the wiring before the network is set up.
 
@@ -185,6 +199,14 @@ The command parser, the blink timing and the settings parser are plain C++ and r
 ```bash
 make -C test
 ```
+
+## Roadmap
+
+- ~~Owner and look on the SD card~~: done in 2.5 (`owner`, `presence`, `scene_<name>`, `PIX`, `…/scene`,
+  `…/config`). status-master still has to publish state names to `<presence>/<owner>` (step 2 of
+  [its roadmap](https://github.com/og-buzz/status-master#roadmap)).
+- **Broker credentials and ACLs** once presence for everyone is on the broker: lights read presence and their own
+  command topic, nothing else.
 
 ## History
 

@@ -3,8 +3,8 @@
 // Plain C++ with no Arduino dependencies, so it can be unit-tested on a PC (see test/).
 //
 // Options after the name, in any order: a speed (SLOW, ON, FAST), up to two colours (names or r/g/b[/ww/cw]
-// percents), a dimmer (a plain percent, e.g. 40), a colour temperature for the white lights (e.g. 4000K) and a
-// rate for the flashers and the strobe (e.g. 25HZ).
+// percents), a dimmer (a plain percent, e.g. 40), a colour temperature for the white lights (e.g. 4000K), a
+// rate for the flashers and the strobe (e.g. 25HZ) and a period for RAMP and PULSE (e.g. 1250MS).
 //
 // An effect paints a range of strip positions (0 = the start of its range); the strip's layout maps
 // positions to physical pixels (Strip.h). Some effects are pure functions of time, others simulate
@@ -28,11 +28,11 @@ enum EffectId : uint8_t {
   // space
   kSpaceFx, kNebulaFx, kMeteorFx,
   // lasers and party
-  kLaserFx, kLasersFx, kScannerFx, kDiscoFx, kStrobeFx, kPoliceFx, kConfettiFx,
+  kLaserFx, kLasersFx, kScannerFx, kDiscoFx, kStrobeFx, kPoliceFx, kConfettiFx, kSparkleFx,
   // colour motion
   kRainbowFx, kPlasmaFx, kCometFx, kTheaterFx, kWipeFx, kMatrixFx,
   // calm
-  kBreatheFx, kHeartbeatFx, kTwinkleFx, kFireplaceFx, kLakeFx,
+  kBreatheFx, kHeartbeatFx, kTwinkleFx, kFireplaceFx, kLakeFx, kRampFx, kPulseFx,
   // warning lights
   kWigwagFx, kQuadFx, kBeaconFx, kHazardFx,
   // white light
@@ -53,8 +53,24 @@ struct EffectSpec {
   uint16_t level;   // dimmer, tenths of a percent (1000 = full)
   uint16_t kelvin;  // white lights' colour temperature, 0 = the effect's own
   uint8_t hz;       // flash rate for flashers and the strobe, 0 = from the speed
-  int16_t first, last;  // the positions the item named
+  uint16_t ms;      // RAMP's and PULSE's period in ms, 0 = from the speed
+  int16_t first, last;  // the positions the item named; physical pixels for PIX items, where last may be below first
+  bool physical;        // a PIX item: drawn on physical pixels from first to last, over the layout
 };
+
+// RAMP: rises evenly from one level to another over a period, then drops straight back. The phase follows
+// absolute time (now % period), so ramps with the same period rise and drop together, strip and IO pins alike.
+const uint16_t kRampMinMs = 100, kRampMaxMs = 60000;
+// The period: ms when given, otherwise 2 s at the normal speed (SLOW 4 s, FAST 1 s).
+uint32_t ramp_period(uint8_t speed, uint16_t ms);
+// The level at time now between from and to (any units), e.g. tenths of a percent.
+uint16_t ramp_level(uint16_t from, uint16_t to, uint32_t period, uint32_t now);
+
+// PULSE: eases from one level to the other and back on a cosine, no hard edges; the whole cycle (up and down)
+// takes one ramp_period, and the phase follows absolute time like RAMP's. The fraction (0..1) of the way from
+// `from` to `to` at time now, and the level itself.
+float pulse_fraction(uint32_t period, uint32_t now);
+uint16_t pulse_level(uint16_t from, uint16_t to, uint32_t period, uint32_t now);
 
 struct EffectState {
   uint8_t a[kEffectMaxPositions];  // per-position values: heat, brightness, trail...

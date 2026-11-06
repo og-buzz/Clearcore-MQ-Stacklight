@@ -10,6 +10,14 @@
 //   .../status   "online", or "offline" as the retained Last Will
 //   .../event    "applied <state>", "rejected <reason>", "button"
 //   .../reset    subscribed only with allow_reset=true; "RESET" reboots the board
+//   .../scene    subscribed; a scene name: shows that scene (scene_<name> in settings.ini, or a built-in look)
+//   .../config   subscribed only with allow_config=true; "scene_<name>=<command>" saves a scene to settings.ini and
+//                uses it at once, "scene_<name>=" removes it; nothing else can be set this way
+//   <presence>/<owner>     with owner= and presence= set: a Teams state (busy, dnd, ...) shows the scene of that name
+//   <presence>/publisher   "offline" (the publisher's Last Will) shows the stale scene until it is back
+//
+// Scenes are named light commands on the SD card (scene_busy=IO4=100;STRIP=0,0,0,3,0;PIX[12]=5,0,0); the Teams
+// states have built-in looks a scene of the same name replaces. PIX items address physical pixels (see Light.h).
 //
 // Commands carry the brightness: colour names light their pins at full brightness, IOn=PERCENT sets one light
 // output (PWM), and STRIP items set the pixels of an addressable WS2805 strip on COM-0 or COM-1 (strip= and
@@ -33,7 +41,7 @@
 
 namespace {
 
-const char* const kVersion = "2.3.0";
+const char* const kVersion = "2.5.0";
 const char* const kSettingsFile = "settings.ini";
 const char* const kBackupFile = "settings.bak";  // the previous settings.ini, written by "set" and "unset"
 const uint32_t kNetRetryMs = 10000;
@@ -91,7 +99,12 @@ int settings_errors = 0;
 bool settings_loaded = false;
 bool mqtt_enabled = false;
 
-char t_command[160], t_status[160], t_event[160], t_reset[160];
+char t_command[160], t_status[160], t_event[160], t_reset[160], t_scene[160], t_config[160];
+char t_presence[160], t_publisher[160];  // with owner= and presence=
+char showing_scene[sl::kSceneNameMax + 1];  // the scene on the light now; empty after a plain command
+char presence_state[sl::kSceneNameMax + 1];  // the owner's last state
+bool publisher_offline = false;
+sl::Settings check_cfg;  // a copy to try a setting on before saving it (set, config): large, so shared
 
 EthernetClient eth;
 PubSubClient mqtt(eth);
@@ -120,7 +133,7 @@ void load_settings() {
     log_line("settings: %s not found on the SD card; outputs stay off and MQTT is disabled", kSettingsFile);
     return;
   }
-  char line[160];
+  char line[320];
   size_t len = 0;
   int line_no = 0;
   bool overflow = false;
@@ -166,6 +179,14 @@ void load_settings() {
   sl::topic(cfg, "status", t_status, sizeof t_status);
   sl::topic(cfg, "event", t_event, sizeof t_event);
   sl::topic(cfg, "reset", t_reset, sizeof t_reset);
+  sl::topic(cfg, "scene", t_scene, sizeof t_scene);
+  sl::topic(cfg, "config", t_config, sizeof t_config);
+  if (sl::follows_presence(cfg)) {
+    snprintf(t_presence, sizeof t_presence, "%s/%s", cfg.presence, cfg.owner);
+    snprintf(t_publisher, sizeof t_publisher, "%s/publisher", cfg.presence);
+  }
+  log_line("settings: %u scene(s)%s%s", cfg.scene_count, sl::follows_presence(cfg) ? ", following " : "",
+           sl::follows_presence(cfg) ? t_presence : "");
 }
 
 // --- light -----------------------------------------------------------------------------------
@@ -270,6 +291,9 @@ void strip_tick() {
     strip_raw_sent = true;
     return;
   }
+  // Render only when a frame can go out, so each render is one frame: an effect's single-frame flash (SPARKLE)
+  // is never drawn and then dropped.
+  if (strip_busy()) return;
   const uint32_t now = millis();
   const int n = cfg.strip_pixels;
   const size_t bytes = (size_t)n * sl::kStripChannels;
@@ -288,7 +312,6 @@ void strip_tick() {
   }
   bool changed = !strip_sent_once || memcmp(strip_pix, strip_last, bytes) != 0;
   if (!changed && now - strip_last_send < kStripRefreshMs) return;
-  if (strip_busy()) return;  // the previous frame is still going out; try again next loop
   const sl::StripTiming& t = sl::strip_timing(cfg.strip_timing);
   sl::strip_encode(strip_pix, n, t, strip_buf);
   strip_send(sl::strip_frame_bytes(n, t));
@@ -358,6 +381,85 @@ void start_network() {
   }
 }
 
+bool update_settings_file(const char* const keys[], const char* const values[], size_t n, const char* who);
+
+// Shows a scene: its scene_<name> command, or a Teams state's built-in look. Returns false if there is none.
+bool play_scene(const char* name, const char* source) {
+  const char* command = sl::scene_command(cfg, name);
+  char label[48];
+  snprintf(label, sizeof label, "%s %s", source, name);
+  if (!command) {
+    log_line("%s: no such scene", label);
+    char msg[64];
+    snprintf(msg, sizeof msg, "rejected unknown scene %s", name);
+    publish_event(msg);
+    return false;
+  }
+  if (!apply_command(command, strlen(command), label)) return false;
+  snprintf(showing_scene, sizeof showing_scene, "%s", name);
+  return true;
+}
+
+// The state name in a presence or scene payload: trimmed and lower-cased, or empty if it isn't a scene name.
+void scene_name_of(const char* text, char* out, size_t cap) {
+  while (*text == ' ') text++;
+  size_t n = 0;
+  while (text[n] && text[n] != ' ' && text[n] != '\r' && text[n] != '\n' && n < cap - 1) {
+    out[n] = (char)tolower((unsigned char)text[n]);
+    n++;
+  }
+  out[n] = '\0';
+  if (!sl::scene_name_ok(out)) out[0] = '\0';
+}
+
+// "scene_<name>=<command>" saves a scene (and uses it now), "scene_<name>=" removes it. Only scene keys.
+void config_message(const char* text) {
+  static char line[400];
+  sl::Settings& check = check_cfg;
+  char msg[160], err[96];
+  snprintf(line, sizeof line, "%s", text);
+  for (char* e = line + strlen(line); e > line && (e[-1] == ' ' || e[-1] == '\r' || e[-1] == '\n');) *--e = '\0';
+  char* eq = strchr(line, '=');
+  char key[40];
+  size_t kl = eq ? (size_t)(eq - line) : 0;
+  if (!eq || kl >= sizeof key || strncmp(line, "scene_", 6) != 0) {
+    log_line("config: rejected (only scene_<name>=<command>)");
+    publish_event("config rejected: only scene_<name>=<command> can be set");
+    return;
+  }
+  memcpy(key, line, kl);
+  key[kl] = '\0';
+  const char* value = eq + 1;
+  const char* name = key + 6;
+  if (!sl::scene_name_ok(name)) {
+    publish_event("config rejected: scene names are 1..23 of a..z, 0..9, _ and -");
+    return;
+  }
+  const char* const keys[1] = {key};
+  if (!*value) {
+    const char* const vals[1] = {nullptr};
+    if (!update_settings_file(keys, vals, 1, "config")) return publish_event("config failed: settings.ini not changed");
+    sl::remove_scene(&cfg, name);
+    log_line("config: %s removed", key);
+    snprintf(msg, sizeof msg, "config removed %s", key);
+    publish_event(msg);
+  } else {
+    check = cfg;
+    if (!sl::apply_line(&check, line, err, sizeof err)) {
+      log_line("config: rejected (%s)", err);
+      snprintf(msg, sizeof msg, "config rejected %s", err);
+      return publish_event(msg);
+    }
+    const char* const vals[1] = {value};
+    if (!update_settings_file(keys, vals, 1, "config")) return publish_event("config failed: settings.ini not changed");
+    sl::apply_line(&cfg, line, err, sizeof err);
+    log_line("config: %s saved", key);
+    snprintf(msg, sizeof msg, "config saved %s", key);
+    publish_event(msg);
+  }
+  if (!strcmp(showing_scene, name)) play_scene(name, "config");  // the scene on the light changed: show the new one
+}
+
 void on_message(char* topic, byte* payload, unsigned int length) {
   static char text[1024];
   if (length >= sizeof text) {
@@ -367,8 +469,39 @@ void on_message(char* topic, byte* payload, unsigned int length) {
   memcpy(text, payload, length);
   text[length] = '\0';
 
+  // Retained messages arrive right after subscribing: ones from before this connection.
+  const bool just_subscribed = millis() - subscribed_at < kStaleResetWindowMs;
   if (strcmp(topic, t_command) == 0) {
-    apply_command(text, length, "mqtt");
+    // A light that follows presence takes its state from the presence topic, not an old retained command.
+    if (sl::follows_presence(cfg) && just_subscribed) {
+      log_line("mqtt: ignored the retained command (following %s)", t_presence);
+      return;
+    }
+    if (apply_command(text, length, "mqtt")) showing_scene[0] = '\0';
+  } else if (strcmp(topic, t_scene) == 0) {
+    char name[sl::kSceneNameMax + 1];
+    scene_name_of(text, name, sizeof name);
+    if (!just_subscribed) play_scene(name[0] ? name : "?", "scene");
+  } else if (sl::follows_presence(cfg) && strcmp(topic, t_presence) == 0) {
+    scene_name_of(text, presence_state, sizeof presence_state);
+    if (!presence_state[0]) {
+      log_line("presence: ignored '%s'", text);
+      return;
+    }
+    if (!publisher_offline) play_scene(presence_state, "presence");
+  } else if (sl::follows_presence(cfg) && strcmp(topic, t_publisher) == 0) {
+    const bool offline = strcmp(text, "offline") == 0;
+    if (offline == publisher_offline) return;
+    publisher_offline = offline;
+    if (offline) play_scene("stale", "presence");
+    else if (presence_state[0]) play_scene(presence_state, "presence");
+  } else if (cfg.allow_config && strcmp(topic, t_config) == 0) {
+    if (length == 0) return;
+    if (just_subscribed) {
+      log_line("config: ignored a retained config message");
+      return;
+    }
+    config_message(text);
   } else if (cfg.allow_reset && strcmp(topic, t_reset) == 0) {
     if (length == 0) return;  // our own clearing of a retained reset
     // A reset message delivered right after subscribing is a retained one from the past: clear it.
@@ -396,7 +529,13 @@ void try_mqtt() {
   if (mqtt.connect(id, user, pass, t_status, 1, true, "offline")) {
     mqtt.publish(t_status, "online", true);
     mqtt.subscribe(t_command, 1);
+    mqtt.subscribe(t_scene, 1);
     if (cfg.allow_reset) mqtt.subscribe(t_reset, 1);
+    if (cfg.allow_config) mqtt.subscribe(t_config, 1);
+    if (sl::follows_presence(cfg)) {
+      mqtt.subscribe(t_presence, 1);
+      mqtt.subscribe(t_publisher, 1);
+    }
     subscribed_at = millis();
     mqtt_backoff = kMqttBackoffMinMs;
     log_line("mqtt: connected to %s:%u as %s; listening on %s", cfg.broker, cfg.port, id, t_command);
@@ -485,9 +624,15 @@ void print_status() {
     log_line("mqtt: %s %s:%u, user %s, reset %s", mqtt.connected() ? "connected to" : "not connected to", cfg.broker,
              cfg.port, cfg.user[0] ? "set" : "none", cfg.allow_reset ? "allowed" : "disabled");
     log_line("topic: %s", t_command);
+    if (sl::follows_presence(cfg)) {
+      log_line("presence: following %s, state %s, publisher %s", t_presence, presence_state[0] ? presence_state : "(none yet)",
+               publisher_offline ? "offline" : "online");
+    }
+    log_line("config: %s", cfg.allow_config ? t_config : "disabled");
   } else {
     log_line("mqtt: disabled");
   }
+  log_line("scenes: %u on the SD card%s%s", cfg.scene_count, showing_scene[0] ? ", showing " : "", showing_scene);
   log_line("light: %s", desc);
 }
 
@@ -691,7 +836,7 @@ bool write_file(const char* name, const char* data, size_t len) {
 // Sets keys in settings.ini, keeping every other line. The old file is kept as settings.bak first, so a failed
 // write never loses the settings. `who` prefixes the messages. Returns true on success.
 bool update_settings_file(const char* const keys[], const char* const values[], size_t n, const char* who) {
-  static char before[4096], after[4352];
+  static char before[8192], after[8704];
   if (!settings_loaded) {
     log_line("%s: no %s was loaded from the SD card; nothing to update", who, kSettingsFile);
     return false;
@@ -742,6 +887,10 @@ void unset_command(const char* args) {
   const char* const keys[1] = {key};
   const char* const vals[1] = {nullptr};
   if (!update_settings_file(keys, vals, 1, "unset")) return;
+  if (!strncmp(key, "scene_", 6) && sl::remove_scene(&cfg, key + 6)) {
+    log_line("unset: %s removed from %s (previous copy: %s) and no longer in use", key, kSettingsFile, kBackupFile);
+    return;
+  }
   log_line("unset: %s removed from %s (previous copy: %s); type 'reboot' to apply", key, kSettingsFile, kBackupFile);
 }
 
@@ -762,9 +911,11 @@ void set_command(const char* args) {
     log_line("set: use 'set <key> <value>', e.g. 'set strip COM0'; see settings.example.ini for the keys");
     return;
   }
-  char line[160], err[96];
+  static char line[400];
+  sl::Settings& check = check_cfg;
+  char err[96];
   snprintf(line, sizeof line, "%s=%s", key, value);
-  sl::Settings check = cfg;
+  check = cfg;
   if (!sl::apply_line(&check, line, err, sizeof err)) {
     log_line("set: %s; not saved", err);
     return;
@@ -772,6 +923,12 @@ void set_command(const char* args) {
   const char* const keys[1] = {key};
   const char* const vals[1] = {value};
   if (!update_settings_file(keys, vals, 1, "set")) return;
+  if (!strncmp(key, "scene_", 6)) {  // scenes are used at once; everything else after a reboot
+    sl::apply_line(&cfg, line, err, sizeof err);
+    log_line("set: %s saved to %s (previous copy: %s) and in use", key, kSettingsFile, kBackupFile);
+    if (!strcmp(showing_scene, key + 6)) play_scene(key + 6, "set");
+    return;
+  }
   log_line("set: %s saved to %s (previous copy: %s); type 'reboot' to apply", key, kSettingsFile, kBackupFile);
 }
 
@@ -791,6 +948,13 @@ void console_tick() {
     if (n == 0) continue;
     if (!strcmp(line, "status") || !strcmp(line, "?")) {
       print_status();
+    } else if (!strcmp(line, "scenes")) {
+      for (int i = 0; i < cfg.scene_count; i++) log_line("scene %s: %s", cfg.scenes[i].name, cfg.scenes[i].command);
+      log_line("scenes: %u on the SD card; the Teams states without one use their built-in looks", cfg.scene_count);
+    } else if (!strncmp(line, "scene ", 6)) {
+      char name[sl::kSceneNameMax + 1];
+      scene_name_of(line + 6, name, sizeof name);
+      play_scene(name[0] ? name : "?", "console scene");
     } else if (!strncmp(line, "unset ", 6)) {
       unset_command(line + 6);
     } else if (!strncmp(line, "set ", 4)) {
@@ -813,10 +977,10 @@ void console_tick() {
       SysMgr.ResetBoard();
     } else if (!strcmp(line, "help")) {
       log_line("commands: a light command (e.g. GREEN, RED,FAST, IO4=100;IO5=26, STRIP[0-9]=100,0,0, OFF), status,");
-      log_line("  set <key> <value> and unset <key> (edit %s), reboot, help", kSettingsFile);
+      log_line("  set <key> <value> and unset <key> (edit %s), scene <name>, scenes, reboot, help", kSettingsFile);
       log_line("  strip tests: strip_timing [n], strip_raw <hex bytes per pixel>, strip_loopback (pin 5 to 3)");
     } else {
-      apply_command(line, n, "console");
+      if (apply_command(line, n, "console")) showing_scene[0] = '\0';
     }
   }
 }

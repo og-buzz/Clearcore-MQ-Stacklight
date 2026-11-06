@@ -15,16 +15,17 @@ struct Named {
   EffectId id;
 };
 const Named kEffects[] = {
-    {"FIRE", kFireFx},         {"CANDLE", kCandleFx},     {"LAVA", kLavaFx},       {"SUNRISE", kSunriseFx},
-    {"WATER", kWaterFx},       {"RAIN", kRainFx},         {"ICE", kIceFx},         {"AURORA", kAuroraFx},
-    {"LIGHTNING", kLightningFx}, {"SPACE", kSpaceFx},     {"NEBULA", kNebulaFx},   {"METEOR", kMeteorFx},
-    {"LASER", kLaserFx},       {"LASERS", kLasersFx},     {"SCANNER", kScannerFx}, {"DISCO", kDiscoFx},
-    {"STROBE", kStrobeFx},     {"POLICE", kPoliceFx},     {"CONFETTI", kConfettiFx}, {"RAINBOW", kRainbowFx},
-    {"PLASMA", kPlasmaFx},     {"COMET", kCometFx},       {"THEATER", kTheaterFx}, {"WIPE", kWipeFx},
-    {"MATRIX", kMatrixFx},     {"BREATHE", kBreatheFx},   {"HEARTBEAT", kHeartbeatFx}, {"TWINKLE", kTwinkleFx},
-    {"FIREPLACE", kFireplaceFx}, {"LAKE", kLakeFx},       {"WIGWAG", kWigwagFx},   {"QUAD", kQuadFx},
-    {"BEACON", kBeaconFx},     {"HAZARD", kHazardFx},     {"LIGHT", kLightFx},     {"DAYLIGHT", kDaylightFx},
-    {"NEUTRAL", kNeutralFx},   {"WARMLIGHT", kWarmLightFx},
+    {"FIRE", kFireFx},          {"CANDLE", kCandleFx},      {"LAVA", kLavaFx},          {"SUNRISE", kSunriseFx},
+    {"WATER", kWaterFx},        {"RAIN", kRainFx},          {"ICE", kIceFx},            {"AURORA", kAuroraFx},
+    {"LIGHTNING", kLightningFx}, {"SPACE", kSpaceFx},        {"NEBULA", kNebulaFx},      {"METEOR", kMeteorFx},
+    {"LASER", kLaserFx},        {"LASERS", kLasersFx},      {"SCANNER", kScannerFx},    {"DISCO", kDiscoFx},
+    {"STROBE", kStrobeFx},      {"POLICE", kPoliceFx},      {"CONFETTI", kConfettiFx},  {"SPARKLE", kSparkleFx},
+    {"RAINBOW", kRainbowFx},    {"PLASMA", kPlasmaFx},      {"COMET", kCometFx},        {"THEATER", kTheaterFx},
+    {"WIPE", kWipeFx},          {"MATRIX", kMatrixFx},      {"BREATHE", kBreatheFx},    {"HEARTBEAT", kHeartbeatFx},
+    {"TWINKLE", kTwinkleFx},    {"FIREPLACE", kFireplaceFx}, {"LAKE", kLakeFx},          {"RAMP", kRampFx},
+    {"PULSE", kPulseFx},        {"WIGWAG", kWigwagFx},      {"QUAD", kQuadFx},          {"BEACON", kBeaconFx},
+    {"HAZARD", kHazardFx},      {"LIGHT", kLightFx},        {"DAYLIGHT", kDaylightFx},  {"NEUTRAL", kNeutralFx},
+    {"WARMLIGHT", kWarmLightFx},
 };
 
 struct NamedColor {
@@ -232,9 +233,31 @@ const uint16_t kColWarm[] = {0, 0, 0, 1000, 200}, kColRed[] = {1000, 0, 0, 0, 0}
                kColRainBlue[] = {0, 300, 1000, 0, 300}, kColMatrixGreen[] = {0, 1000, 150, 0, 0},
                kColMeteorWhite[] = {0, 150, 400, 400, 1000}, kColCometCyan[] = {0, 600, 1000, 0, 300},
                kColAmber[] = {1000, 450, 0, 300, 0}, kColBreatheBlue[] = {0, 300, 1000, 0, 0},
-               kColWhite[] = {1000, 1000, 1000, 1000, 1000}, kColOff[] = {0, 0, 0, 0, 0}, kColDimWarm[] = {0, 0, 0, 40, 0};
+               kColWhite[] = {1000, 1000, 1000, 1000, 1000}, kColOff[] = {0, 0, 0, 0, 0},
+               kColDimWarm[] = {0, 0, 0, 40, 0}, kColCool[] = {0, 0, 0, 0, 1000};
 
 }  // namespace
+
+uint32_t ramp_period(uint8_t speed, uint16_t ms) {
+  if (ms) return ms;
+  return speed == 0 ? 4000 : speed == 2 ? 1000 : 2000;
+}
+
+uint16_t ramp_level(uint16_t from, uint16_t to, uint32_t period, uint32_t now) {
+  if (!period) return to;
+  const int64_t d = (int64_t)to - (int64_t)from;
+  return (uint16_t)((int64_t)from + d * (int64_t)(now % period) / (int64_t)period);
+}
+
+float pulse_fraction(uint32_t period, uint32_t now) {
+  if (!period) return 1.0f;
+  return 0.5f - 0.5f * cosf(2 * kPi * (float)(now % period) / (float)period);
+}
+
+uint16_t pulse_level(uint16_t from, uint16_t to, uint32_t period, uint32_t now) {
+  const float v = (float)from + ((float)to - (float)from) * pulse_fraction(period, now);
+  return (uint16_t)(v + 0.5f);
+}
 
 const char* effect_name(EffectId id) {
   for (const Named& e : kEffects)
@@ -617,6 +640,36 @@ void effect_render(const EffectSpec& sp, EffectState* st, int n, bool wrap, uint
       }
       break;
 
+    case kSparkleFx: {
+      // Random pixels flash in the first colour for a single frame (about 2 ms on a short strip) over the
+      // second (default dark): 25 flashes a second over the range (SLOW 10, FAST 50, or NNHZ). strip_render
+      // draws it on physical pixels (n = the pixels in the range), not positions, so legs flash independently.
+      // Each render is one frame (the sketch renders only when it can send): a flash is drawn once, never skipped.
+      color_of(sp, 0, kColCool, c1);
+      color_of(sp, 1, kColOff, c2);
+      const uint32_t rate = sp.hz ? sp.hz : sp.speed == 0 ? 10 : sp.speed == 2 ? 50 : 25;
+      if (!st->started) {
+        st->started = true;
+        st->next_ms = now;
+        st->v[0] = 0;
+      }
+      uint32_t dt = now - st->next_ms;
+      if (dt > 1000) dt = 1000;  // after a pause, not a burst
+      st->next_ms = now;
+      st->v[0] += (int32_t)(rate * dt);  // flashes due, in thousandths
+      for (int p = 0; p < n; p++) {
+        Px x;
+        x.add(c2, 1.0f);
+        x.store(out[p]);
+      }
+      for (; st->v[0] >= 1000; st->v[0] -= 1000) {
+        Px x;
+        x.add(c1, 1.0f);
+        x.store(out[rnd(st) % (uint32_t)n]);
+      }
+      break;
+    }
+
     case kRainbowFx:
       for (int p = 0; p < n; p++) {
         float col[kEffectChannels];
@@ -691,6 +744,28 @@ void effect_render(const EffectSpec& sp, EffectState* st, int n, bool wrap, uint
       for (int p = 0; p < n; p++) {
         Px x;
         x.add(c1, 0.04f + 0.96f * b * b);
+        x.store(out[p]);
+      }
+      break;
+    }
+
+    case kRampFx:
+    case kPulseFx: {
+      // Two colours: from the first up to the second; one colour: from dark up to it. RAMP drops straight back,
+      // PULSE eases back down.
+      if (sp.ncolors >= 2) {
+        color_of(sp, 0, kColOff, c1);
+        color_of(sp, 1, kColOff, c2);
+      } else {
+        color_of(sp, 1, kColOff, c1);  // fewer than two colours: start from dark
+        color_of(sp, 0, kColWarm, c2);
+      }
+      const uint32_t period = ramp_period(sp.speed, sp.ms);
+      const float f = sp.id == kPulseFx ? pulse_fraction(period, now) : (float)(now % period) / (float)period;
+      for (int p = 0; p < n; p++) {
+        Px x;
+        x.add(c1, 1.0f - f);
+        x.add(c2, f);
         x.store(out[p]);
       }
       break;

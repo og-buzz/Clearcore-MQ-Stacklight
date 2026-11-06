@@ -11,6 +11,16 @@
 
 namespace sl {
 
+// Scenes: named light commands kept in settings.ini as scene_<name>=<command>. The Teams states (available, busy,
+// call, dnd, away, brb, offline, unknown, stale) have built-in looks that a scene of the same name replaces.
+const int kMaxScenes = 16;
+const size_t kSceneNameMax = 23;      // a..z, 0..9, '_' and '-'
+const size_t kSceneCommandMax = 240;  // characters of the command
+struct Scene {
+  char name[kSceneNameMax + 1];
+  char command[kSceneCommandMax + 1];
+};
+
 // Inputs and outputs a setting can name. Outputs (light channels) must be IO0..IO5.
 enum Pin : int8_t { kNoPin = -1, kIO0, kIO1, kIO2, kIO3, kIO4, kIO5, kDI6, kDI7, kDI8, kPinCount };
 
@@ -40,6 +50,12 @@ struct Settings {
   char strip_layout[64];       // line, ring, fold or a pixel map (see Strip.h Layout)
   Timing timing;
   bool allow_reset;
+  // Following a person: with both set, the light shows the scene named by the state on <presence>/<owner>
+  char owner[64];     // e.g. their UPN
+  char presence[64];  // presence topic prefix, e.g. ctms/presence
+  bool allow_config;  // accept scene_* settings on .../config (off by default)
+  Scene scenes[kMaxScenes];
+  uint8_t scene_count;
 };
 
 const int8_t kNoStrip = -1;
@@ -58,6 +74,18 @@ bool mqtt_ready(const Settings& s, char* err, size_t err_cap);
 
 // False if two settings name the same pin; writes which.
 bool pins_ok(const Settings& s, char* err, size_t err_cap);
+
+// Whether name is a scene name: 1..23 of a..z, 0..9, '_' and '-'.
+bool scene_name_ok(const char* name);
+
+// A scene's command: its scene_<name> setting, else the built-in look for a Teams state; nullptr for neither.
+const char* scene_command(const Settings& s, const char* name);
+
+// Takes scene_<name> out of s (settings.ini is changed separately). False if there was no such scene.
+bool remove_scene(Settings* s, const char* name);
+
+// Whether the light follows a person (owner and presence both set).
+inline bool follows_presence(const Settings& s) { return s.owner[0] && s.presence[0]; }
 
 // "{project}/{client}/{site}/{role}/{kind}"; returns false if it doesn't fit.
 bool topic(const Settings& s, const char* kind, char* out, size_t cap);

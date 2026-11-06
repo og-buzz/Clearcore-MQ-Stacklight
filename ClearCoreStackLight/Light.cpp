@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <utility>
+
 namespace sl {
 
 namespace {
@@ -94,6 +96,67 @@ int parse_values(char* values, uint16_t* levels, int max_levels, Mode* mode, cha
   return n;
 }
 
+// "1250MS": a ramp period in milliseconds, kRampMinMs..kRampMaxMs.
+bool parse_period(const char* tok, uint16_t* ms) {
+  size_t tl = strlen(tok);
+  if (tl < 3 || strcmp(tok + tl - 2, "MS") != 0) return false;
+  unsigned v = 0;
+  for (size_t i = 0; i < tl - 2; i++) {
+    if (!isdigit((unsigned char)tok[i])) return false;
+    v = v * 10 + (unsigned)(tok[i] - '0');
+    if (v > kRampMaxMs) return false;
+  }
+  if (v < kRampMinMs) return false;
+  *ms = (uint16_t)v;
+  return true;
+}
+
+// The options of IOn=RAMP|PULSE,[FROM,]TO[,SPEED][,NNNMS], after the name (trimmed and upper-cased). One percent
+// starts from 0. Returns false with err set.
+bool parse_io_wave(char* rest, Wave wave, const char* key, Output* out, char* err, size_t err_cap) {
+  Output r;
+  memset(&r, 0, sizeof r);  // padding too, so equal states compare equal
+  r.mode = kOn;
+  r.wave = wave;
+  r.speed = 1;
+  uint16_t lv[2];
+  int n = 0;
+  while (*rest == ' ') rest++;
+  if (*rest == ',') rest++;
+  for (char* tok = rest; tok;) {
+    char* comma = strchr(tok, ',');
+    if (comma) *comma = '\0';
+    char* next = comma ? comma + 1 : nullptr;
+    while (*tok == ' ') tok++;
+    for (char* e = tok + strlen(tok); e > tok && e[-1] == ' ';) *--e = '\0';
+    Mode m;
+    uint16_t v;
+    if (parse_level(tok, &v)) {
+      if (n == 2) {
+        copy_err(err, err_cap, "RAMP and PULSE take two percents (from, to), at", tok);
+        return false;
+      }
+      lv[n++] = v;
+    } else if (parse_mode(tok, &m) && m != kOff) {
+      r.speed = m == kSlow ? 0 : m == kFast ? 2 : 1;
+    } else if (parse_period(tok, &v)) {
+      r.ms = v;
+    } else {
+      copy_err(err, err_cap, "RAMP/PULSE take percents, SLOW/ON/FAST, a period (1250MS):", tok);
+      return false;
+    }
+    tok = next;
+  }
+  if (n == 0) {
+    copy_err(err, err_cap, "RAMP and PULSE need percents, e.g. IO4=RAMP,50,100:", key);
+    return false;
+  }
+  r.from = n == 2 ? lv[0] : 0;
+  r.level = lv[n - 1];
+  *out = r;
+  return true;
+}
+
 // An item with '=': IOn=... or STRIP[...]=... (text trimmed and upper-cased). Returns false with err set.
 bool parse_assignment(char* item, State* s, char* err, size_t err_cap) {
   char* eq = strchr(item, '=');
@@ -110,6 +173,14 @@ bool parse_assignment(char* item, State* s, char* err, size_t err_cap) {
       copy_err(err, err_cap, "IO pins are IO0..IO5, got", key);
       return false;
     }
+    while (*values == ' ') values++;
+    for (const auto& w : {std::pair<const char*, Wave>{"RAMP", kWaveRamp}, {"PULSE", kWavePulse}}) {
+      const size_t wl = strlen(w.first);
+      if (strncmp(values, w.first, wl) || (values[wl] != '\0' && values[wl] != ',' && values[wl] != ' ')) continue;
+      if (!parse_io_wave(values + wl, w.second, key, &s->io[pin], err, err_cap)) return false;
+      s->io_set[pin] = true;
+      return true;
+    }
     int n = parse_values(values, levels, 1, &mode, err, err_cap);
     if (n < 0) return false;
     if (n != 1) {
@@ -118,18 +189,21 @@ bool parse_assignment(char* item, State* s, char* err, size_t err_cap) {
     }
     if (mode == kOff) levels[0] = 0, mode = kOn;  // off is off, whatever the level
     s->io_set[pin] = true;
+    memset(&s->io[pin], 0, sizeof s->io[pin]);
     s->io[pin].level = levels[0];
     s->io[pin].mode = mode;
     return true;
   }
 
-  if (!strncmp(key, "STRIP", 5)) {
+  // STRIP items address layout positions; PIX items address physical pixels, and may run backwards.
+  const bool phys = !strncmp(key, "PIX", 3) && (key[3] == '\0' || key[3] == '[');
+  if (phys || !strncmp(key, "STRIP", 5)) {
     int first = 0, last = kLightMaxPixels - 1;
-    const char* k = key + 5;
+    const char* k = key + (phys ? 3 : 5);
     if (*k == '[') {
       const char* close = strchr(k, ']');
       if (!close || close[1] != '\0') {
-        copy_err(err, err_cap, "pixels are STRIP[n] or STRIP[a-b], got", key);
+        copy_err(err, err_cap, phys ? "pixels are PIX[n] or PIX[a-b], got" : "pixels are STRIP[n] or STRIP[a-b], got", key);
         return false;
       }
       const char* dash = (const char*)memchr(k + 1, '-', (size_t)(close - k - 1));
@@ -139,7 +213,7 @@ bool parse_assignment(char* item, State* s, char* err, size_t err_cap) {
         return false;
       }
       if (!dash) last = first;
-      if (last < first) {
+      if (last < first && !phys) {
         copy_err(err, err_cap, "pixel range runs backwards:", key);
         return false;
       }
@@ -166,6 +240,7 @@ bool parse_assignment(char* item, State* s, char* err, size_t err_cap) {
       e.level = 1000;
       e.first = (int16_t)first;
       e.last = (int16_t)last;
+      e.physical = phys;
       for (char* tok = values + nl; *tok;) {
         while (*tok == ',' || *tok == ' ') tok++;
         if (!*tok) break;
@@ -175,7 +250,7 @@ bool parse_assignment(char* item, State* s, char* err, size_t err_cap) {
         *end = '\0';
         for (char* e2 = end; e2 > tok && e2[-1] == ' ';) *--e2 = '\0';
         Mode m;
-        uint16_t lvl;
+        uint16_t lvl, ms;
         size_t tl = strlen(tok);
         int num = 0;
         bool digits = tl > 0;
@@ -193,10 +268,12 @@ bool parse_assignment(char* item, State* s, char* err, size_t err_cap) {
           e.kelvin = (uint16_t)num;
         } else if (digits && tl >= 3 && !strcmp(tok + tl - 2, "HZ") && sscanf(tok, "%d", &num) == 1 && num >= 1 && num <= 60) {
           e.hz = (uint8_t)num;
+        } else if (parse_period(tok, &ms)) {
+          e.ms = ms;
         } else if (e.ncolors < 2 && parse_effect_color(tok, e.color[e.ncolors])) {
           e.ncolors++;
         } else {
-          copy_err(err, err_cap, "not a speed, colour, dimmer (%), kelvin (4000K) or rate (25HZ):", tok);
+          copy_err(err, err_cap, "not a speed, colour, dimmer (%), 4000K, 25HZ or 1250MS:", tok);
           return false;
         }
         *end = saved;
@@ -204,10 +281,18 @@ bool parse_assignment(char* item, State* s, char* err, size_t err_cap) {
       }
       s->fx_count++;
       s->strip_set = true;
-      for (int p = first; p <= last; p++) {
-        memset(s->pixel[p], 0, sizeof s->pixel[p]);
-        s->pixel_mode[p] = kOn;
-        s->pixel_fx[p] = s->fx_count;
+      const int lo = first < last ? first : last, hi = first < last ? last : first;
+      for (int p = lo; p <= hi; p++) {
+        if (phys) {
+          s->px_set[p] = true;
+          memset(s->px[p], 0, sizeof s->px[p]);
+          s->px_mode[p] = kOn;
+          s->px_fx[p] = s->fx_count;
+        } else {
+          memset(s->pixel[p], 0, sizeof s->pixel[p]);
+          s->pixel_mode[p] = kOn;
+          s->pixel_fx[p] = s->fx_count;
+        }
       }
       return true;
     }
@@ -223,10 +308,18 @@ bool parse_assignment(char* item, State* s, char* err, size_t err_cap) {
     for (int c = 0; c < kPixelChannels; c++) dark = dark && levels[c] == 0;
     if (dark) mode = kOn;  // a dark pixel is the same in any mode
     s->strip_set = true;
-    for (int p = first; p <= last; p++) {
-      memcpy(s->pixel[p], levels, sizeof levels);
-      s->pixel_mode[p] = mode;
-      s->pixel_fx[p] = 0;
+    const int lo = first < last ? first : last, hi = first < last ? last : first;
+    for (int p = lo; p <= hi; p++) {
+      if (phys) {
+        s->px_set[p] = true;
+        memcpy(s->px[p], levels, sizeof levels);
+        s->px_mode[p] = mode;
+        s->px_fx[p] = 0;
+      } else {
+        memcpy(s->pixel[p], levels, sizeof levels);
+        s->pixel_mode[p] = mode;
+        s->pixel_fx[p] = 0;
+      }
     }
     return true;
   }
@@ -256,16 +349,54 @@ void add_levels(Out& o, const uint16_t* levels, int n, Mode mode) {
   if (mode != kOn) o.add(",%s", kModeNames[mode]);
 }
 
+// An effect item's value: NAME[,SPEED][,DIMMER][,K][,HZ][,MS][,COLOUR][,COLOUR].
+void add_effect(Out& o, const EffectSpec& e) {
+  o.add("%s", effect_name(e.id));
+  if (e.speed != 1) o.add(",%s", e.speed == 0 ? "SLOW" : "FAST");
+  char num[16];
+  if (e.level != 1000) {
+    format_level(e.level, num, sizeof num);
+    o.add(",%s", num);
+  }
+  if (e.kelvin) {
+    snprintf(num, sizeof num, "%uK", e.kelvin);
+    o.add(",%s", num);
+  }
+  if (e.hz) {
+    snprintf(num, sizeof num, "%uHZ", e.hz);
+    o.add(",%s", num);
+  }
+  if (e.ms) {
+    snprintf(num, sizeof num, "%uMS", e.ms);
+    o.add(",%s", num);
+  }
+  for (int k = 0; k < e.ncolors; k++) {
+    for (int c = 0; c < kEffectChannels; c++) {
+      char v[8];
+      format_level(e.color[k][c], v, sizeof v);
+      o.add(c ? "/%s" : ",%s", v);
+    }
+  }
+}
+
 }  // namespace
 
 void clear(State* s) {
   memset(s, 0, sizeof *s);  // everything off; also zeroes padding, so equal states compare equal
   for (int i = 0; i < kIoPins; i++) s->io[i].mode = kOn;
-  for (int p = 0; p < kLightMaxPixels; p++) s->pixel_mode[p] = kOn;
+  for (int p = 0; p < kLightMaxPixels; p++) s->pixel_mode[p] = s->px_mode[p] = kOn;
+}
+
+namespace {
+State scratch;  // parse_command's working state: large, so not on the stack
+}
+
+bool check_command(const char* text, size_t len, char* err, size_t err_cap) {
+  return parse_command(text, len, nullptr, err, err_cap);
 }
 
 bool parse_command(const char* text, size_t len, State* out, char* err, size_t err_cap) {
-  static State s;  // large: not on the stack
+  State& s = scratch;
   clear(&s);
   const char* p = text;
   const char* end = text + len;
@@ -332,7 +463,7 @@ bool parse_command(const char* text, size_t len, State* out, char* err, size_t e
     copy_err(err, err_cap, "empty command", "");
     return false;
   }
-  *out = s;
+  if (out) *out = s;
   return true;
 }
 
@@ -363,8 +494,14 @@ void io_duty(const State& s, const Timing& t, uint32_t now, const int8_t pin[kCh
   memset(duty, 0, kIoPins);
   for (uint8_t c = 0; c < kChannels; c++)
     if (pin[c] >= 0 && pin[c] < kIoPins && on[c]) duty[pin[c]] = 255;
-  for (int p = 0; p < kIoPins; p++)
-    if (s.io_set[p]) duty[p] = blink(s.io[p].mode, t, now) ? level_duty(s.io[p].level) : 0;
+  for (int p = 0; p < kIoPins; p++) {
+    if (!s.io_set[p]) continue;
+    const Output& o = s.io[p];
+    const uint32_t period = ramp_period(o.speed, o.ms);
+    if (o.wave == kWaveRamp) duty[p] = level_duty(ramp_level(o.from, o.level, period, now));
+    else if (o.wave == kWavePulse) duty[p] = level_duty(pulse_level(o.from, o.level, period, now));
+    else duty[p] = blink(o.mode, t, now) ? level_duty(o.level) : 0;
+  }
 }
 
 uint8_t level_duty(uint16_t tenths) {
@@ -429,7 +566,21 @@ void describe(const State& s, char* buf, size_t cap) {
     snprintf(key, sizeof key, "IO%d", p);
     o.sep();
     o.add("%s=", key);
-    add_levels(o, &s.io[p].level, 1, s.io[p].mode);
+    const Output& io = s.io[p];
+    if (io.wave != kSteady) {
+      char from[8], to[8], ms[16];
+      format_level(io.from, from, sizeof from);
+      format_level(io.level, to, sizeof to);
+      o.add(io.wave == kWavePulse ? "PULSE," : "RAMP,");
+      o.add("%s,%s", from, to);
+      if (io.speed != 1) o.add(",%s", io.speed == 0 ? "SLOW" : "FAST");
+      if (io.ms) {
+        snprintf(ms, sizeof ms, "%uMS", io.ms);
+        o.add(",%s", ms);
+      }
+    } else {
+      add_levels(o, &io.level, 1, io.mode);
+    }
   }
   if (s.strip_set) {
     // Runs of identical pixels; dark runs are left out (a STRIP item starts from a dark strip).
@@ -451,34 +602,37 @@ void describe(const State& s, char* buf, size_t cap) {
         else if (first == last) o.add("STRIP[%s]=", a);
         else o.add("STRIP[%s-%s]=", a, z);
         if (s.pixel_fx[first]) {
-          const EffectSpec& e = s.fx[s.pixel_fx[first] - 1];
-          o.add("%s", effect_name(e.id));
-          if (e.speed != 1) o.add(",%s", e.speed == 0 ? "SLOW" : "FAST");
-          char num[16];
-          if (e.level != 1000) {
-            format_level(e.level, num, sizeof num);
-            o.add(",%s", num);
-          }
-          if (e.kelvin) {
-            snprintf(num, sizeof num, "%uK", e.kelvin);
-            o.add(",%s", num);
-          }
-          if (e.hz) {
-            snprintf(num, sizeof num, "%uHZ", e.hz);
-            o.add(",%s", num);
-          }
-          for (int k = 0; k < e.ncolors; k++) {
-            for (int c = 0; c < kEffectChannels; c++) {
-              char v[8];
-              format_level(e.color[k][c], v, sizeof v);
-              o.add(c ? "/%s" : ",%s", v);
-            }
-          }
+          add_effect(o, s.fx[s.pixel_fx[first] - 1]);
         } else {
           add_levels(o, s.pixel[first], kPixelChannels, s.pixel_mode[first]);
         }
         wrote = true;
       }
+      first = last + 1;
+    }
+    // PIX runs: physical pixels set by PIX items (dark ones included: they cover the layout).
+    for (int first = 0; first < kLightMaxPixels;) {
+      if (!s.px_set[first]) {
+        first++;
+        continue;
+      }
+      int last = first;
+      while (last + 1 < kLightMaxPixels && s.px_set[last + 1] && s.px_mode[last + 1] == s.px_mode[first] &&
+             s.px_fx[last + 1] == s.px_fx[first] && !memcmp(s.px[last + 1], s.px[first], sizeof s.px[first]))
+        last++;
+      const EffectSpec* e = s.px_fx[first] ? &s.fx[s.px_fx[first] - 1] : nullptr;
+      int a = first, z = last;
+      if (e && e->first > e->last) a = last, z = first;  // a backwards effect stays backwards
+      char ra[12], rz[12];
+      snprintf(ra, sizeof ra, "%d", a);
+      snprintf(rz, sizeof rz, "%d", z);
+      o.sep();
+      if (first == 0 && last == kLightMaxPixels - 1) o.add("PIX=");
+      else if (first == last) o.add("PIX[%s]=", ra);
+      else o.add("PIX[%s-%s]=", ra, rz);
+      if (e) add_effect(o, *e);
+      else add_levels(o, s.px[first], kPixelChannels, s.px_mode[first]);
+      wrote = true;
       first = last + 1;
     }
     if (!wrote) {
