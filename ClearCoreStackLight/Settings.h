@@ -49,6 +49,8 @@ struct Settings {
   uint8_t strip_order[3];      // colour sent in each of the first three byte positions: 0 red, 1 green, 2 blue
   char strip_layout[64];       // line, ring, fold or a pixel map (see Strip.h Layout)
   Timing timing;
+  uint16_t transition_ms;      // a change of look fades in over this long, 0 = at once (see Transition.h)
+  uint16_t transition_sparkle; // the sparkles' brightest channel during a transition, tenths of a percent; 0 = none
   bool allow_reset;
   // Following a person: with both set, the light shows the scene named by the state on <presence>/<owner>
   char owner[64];     // e.g. their UPN

@@ -48,6 +48,7 @@ Copy [`settings.example.ini`](settings.example.ini) to the root of the microSD c
 | `button` | Input for a push button: `IO0`..`IO5`, `DI6`..`DI8` or `none` |
 | `fast_on`, `fast_off`, `slow_on`, `slow_off` | Blink timing in milliseconds |
 | `allow_reset` | `true` to allow a reboot over MQTT (default `false`) |
+| `transition`, `transition_sparkle` | How a change of look fades in: over `transition` ms (default `2000`, `0` = at once), with sparkles at least `transition_sparkle` % bright (default `20`, `0` = none); see [Transitions](#transitions) |
 | `scene_<name>` | A named light command (at most 16, 240 characters each), e.g. `scene_busy=IO4=100;STRIP=0,0,0,3,0;PIX[12]=5,0,0`. The Teams states `available`, `busy`, `call`, `dnd`, `away`, `brb`, `offline`, `unknown` and `stale` have built-in looks (`GREEN`, `RED`, `RED`, `RED,SLOW`, `YELLOW`, `YELLOW,SLOW`, `OFF`, `OFF`, `OFF`) that a scene of the same name replaces |
 | `owner`, `presence` | Follow a person: with both set, the light subscribes to `<presence>/<owner>` and shows the scene named by each state published there, and the `stale` scene while `<presence>/publisher` is `offline` |
 | `allow_config` | `true` to accept `scene_*` settings on `…/config` (default `false`) |
@@ -103,6 +104,21 @@ mosquitto_pub -h <broker> -t $T -r -m 'OFF'
 ```
 
 The 2024 payloads such as `RED,ON` and `ALL,OFF` still work, with one change: each command now sets the whole light, so `GREEN,ON` turns red off.
+
+## Transitions
+
+When a command, scene or presence state changes the look, the light fades from what it was showing into the new
+look over `transition` ms (default 2000) instead of switching at once:
+
+- the light outputs crossfade, eased, from their old brightness to the new;
+- on the strip a soft front sweeps from position 0 to the end of the `strip_layout` (on a `fold`, up both legs
+  together), each pixel easing into the new look as the front passes, and sparkles flash and fade out where the
+  front is crossing. They take the colour of the new look's brightest pixel (the old look's when the new one is
+  dark), at `transition_sparkle` % (default 20) or that pixel's own level if it is brighter.
+
+The new look is live during the fade, so a pulsing or blinking look already moves. A change during a transition
+starts from what is showing, and the same command again (a retained resend after a reconnect) doesn't fade.
+`transition=0` switches at once, as before 2.7.
 
 ## Strip effects
 

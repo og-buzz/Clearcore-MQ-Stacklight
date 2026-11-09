@@ -8,6 +8,7 @@
 #include "../ClearCoreStackLight/Light.h"
 #include "../ClearCoreStackLight/Settings.h"
 #include "../ClearCoreStackLight/Strip.h"
+#include "../ClearCoreStackLight/Transition.h"
 
 #include <algorithm>
 #include <vector>
@@ -991,6 +992,99 @@ static void test_breadcrumb() {
   duration_text(tiny, 0, 16000);  // no room: nothing written, no crash
 }
 
+// Transitions: the old look fades into the new one, along the strip with sparkles, the light outputs crossfading.
+static void test_transition() {
+  static Transition tr;
+  static Layout L;
+  char err[64];
+  const int n = 20;
+  CHECK(layout_parse("line", n, &L, err, sizeof err));
+  uint8_t from_duty[kIoPins] = {0, 0, 0, 0, 200, 0};
+  static uint8_t from_pix[n * kStripChannels], pix[n * kStripChannels];
+  for (int i = 0; i < n; i++) from_pix[i * kStripChannels + 0] = 100;  // all red
+  auto green = [&]() {
+    memset(pix, 0, sizeof pix);
+    for (int i = 0; i < n; i++) pix[i * kStripChannels + 1] = 60;
+  };
+
+  transition_start(&tr, 1000, 2000, 51, from_duty, from_pix, n, 7);
+  CHECK(transition_running(&tr, 1000));
+  uint8_t duty[kIoPins] = {0, 0, 0, 0, 0, 100};
+  transition_io(tr, 1000, duty);
+  CHECK(duty[4] == 200 && duty[5] == 0);  // starts from the old duty
+  uint8_t mid[kIoPins] = {0, 0, 0, 0, 0, 100};
+  transition_io(tr, 2000, mid);
+  CHECK(mid[4] == 100 && mid[5] == 50);  // halfway, eased
+  green();
+  transition_strip(&tr, 1000, L, n, pix);
+  CHECK(pix[0] == 100 && pix[1] == 0 && pix[(n - 1) * kStripChannels] == 100);  // the old frame at the start
+
+  // The front sweeps from position 0: early on the start of the strip has changed and the end hasn't.
+  green();
+  transition_strip(&tr, 1900, L, n, pix);
+  const uint8_t* last = pix + (n - 1) * kStripChannels;
+  CHECK(pix[1] > last[1] && last[0] == 100);
+
+  // Sparkles: against the same transition without them, only brighter, only in the new colour (green), and only
+  // while the front crosses (nothing after it has passed the strip).
+  static Transition plain;
+  static uint8_t base[n * kStripChannels];
+  auto sparkle_run = [&](uint8_t sparkle, bool into_dark, int* brighter, int* other, int* late) {
+    transition_start(&tr, 1000, 2000, sparkle, from_duty, from_pix, n, 7);
+    transition_start(&plain, 1000, 2000, 0, from_duty, from_pix, n, 7);
+    *brighter = *other = *late = 0;
+    for (uint32_t t = 1000; t < 3000; t += 2) {
+      green();
+      if (into_dark) memset(pix, 0, sizeof pix);
+      memcpy(base, pix, sizeof pix);
+      transition_strip(&tr, t, L, n, pix);
+      transition_strip(&plain, t, L, n, base);
+      for (int i = 0; i < n * kStripChannels; i++) {
+        if (pix[i] < base[i] || (pix[i] > base[i] && i % kStripChannels != (into_dark ? 0 : 1))) (*other)++;
+        if (pix[i] > base[i]) {
+          (*brighter)++;
+          if (t > 2900) (*late)++;
+        }
+      }
+    }
+  };
+  int brighter, other, late;
+  sparkle_run(51, false, &brighter, &other, &late);
+  CHECK(brighter > 50 && other == 0 && late == 0);
+  sparkle_run(51, true, &brighter, &other, &late);  // into a dark look: the old colour, red
+  CHECK(brighter > 50 && other == 0);
+  sparkle_run(0, false, &brighter, &other, &late);  // transition_sparkle=0: none
+  CHECK(brighter == 0 && other == 0);
+  transition_start(&tr, 1000, 2000, 51, from_duty, from_pix, n, 7);
+
+  // Done: the new look exactly, and the transition stops by itself.
+  green();
+  transition_strip(&tr, 2999, L, n, pix);
+  CHECK(pix[0] == 0 && pix[1] == 60 && last[0] == 0 && last[1] == 60);
+  CHECK(!transition_running(&tr, 3000));
+  uint8_t end[kIoPins] = {0, 0, 0, 0, 0, 100};
+  transition_io(tr, 3000, end);
+  CHECK(end[4] == 0 && end[5] == 100);
+
+  // transition=0: no transition, the new look at once; no old frame counts as dark.
+  transition_start(&tr, 0, 0, 51, from_duty, nullptr, n, 7);
+  CHECK(!transition_running(&tr, 0));
+  transition_start(&tr, 0, 2000, 0, from_duty, nullptr, n, 7);
+  green();
+  transition_strip(&tr, 0, L, n, pix);
+  CHECK(pix[1] == 0);
+
+  // Settings.
+  static Settings st;
+  defaults(&st);
+  CHECK(st.transition_ms == 2000 && st.transition_sparkle == 200);
+  CHECK(apply_line(&st, "transition=500", err, sizeof err) && st.transition_ms == 500);
+  CHECK(apply_line(&st, "transition=0", err, sizeof err) && st.transition_ms == 0);
+  CHECK(!apply_line(&st, "transition=10001", err, sizeof err) && strstr(err, "transition"));
+  CHECK(apply_line(&st, "transition_sparkle=37.5", err, sizeof err) && st.transition_sparkle == 375);
+  CHECK(!apply_line(&st, "transition_sparkle=101", err, sizeof err));
+}
+
 int main() {
   test_commands();
   test_blink();
@@ -1006,6 +1100,7 @@ int main() {
   test_pix();
   test_scenes();
   test_breadcrumb();
+  test_transition();
   if (failures) {
     fprintf(stderr, "%d check(s) failed\n", failures);
     return 1;

@@ -16,6 +16,9 @@
 //   <presence>/<owner>     with owner= and presence= set: a Teams state (busy, dnd, ...) shows the scene of that name
 //   <presence>/publisher   "offline" (the publisher's Last Will) shows the stale scene until it is back
 //
+// A change of look fades in over transition= ms (default 2000): the strip changes behind a front sweeping along
+// it, with sparkles in the new colour, and the light outputs crossfade (see Transition.h).
+//
 // Scenes are named light commands on the SD card (scene_busy=IO4=100;STRIP=0,0,0,3,0;PIX[12]=5,0,0); the Teams
 // states have built-in looks a scene of the same name replaces. PIX items address physical pixels (see Light.h).
 //
@@ -45,10 +48,11 @@
 #include "Light.h"
 #include "Settings.h"
 #include "Strip.h"
+#include "Transition.h"
 
 namespace {
 
-const char* const kVersion = "2.6.0";
+const char* const kVersion = "2.7.0";
 const char* const kSettingsFile = "settings.ini";
 const char* const kBackupFile = "settings.bak";  // the previous settings.ini, written by "set" and "unset"
 const uint32_t kNetRetryMs = 10000;
@@ -63,6 +67,7 @@ DigitalInOut* const kOutput[6] = {&ConnectorIO0, &ConnectorIO1, &ConnectorIO2,
 sl::Settings cfg;
 sl::State light;
 int16_t written[sl::kIoPins];  // last PWM duty written per IO pin; -1 = not a light output
+sl::Transition transition;     // the fade from the previous look to this one (see Transition.h)
 
 // Light outputs are the IO pins settings.ini names for red, green, blue and alarm.
 bool is_light_output(int pin) {
@@ -482,6 +487,7 @@ void strip_tick() {
     }
   } else {
     sl::strip_render(light, cfg.timing, now, strip_map, cfg.strip_order, &strip_fx, n, strip_pix);
+    if (sl::transition_running(&transition, now)) sl::transition_strip(&transition, now, strip_map, n, strip_pix);
   }
   bool changed = !strip_sent_once || memcmp(strip_pix, strip_last, bytes) != 0;
   if (!changed && now - strip_last_send < kStripRefreshMs) return;
@@ -497,7 +503,9 @@ void update_light() {
   strip_tick();
   step(sl::kStepLight);
   uint8_t duty[sl::kIoPins];
-  sl::io_duty(light, cfg.timing, millis(), cfg.pin, duty);
+  const uint32_t now = millis();
+  sl::io_duty(light, cfg.timing, now, cfg.pin, duty);
+  if (sl::transition_running(&transition, now)) sl::transition_io(transition, now, duty);
   for (int p = 0; p < sl::kIoPins; p++) {
     if (written[p] < 0 || duty[p] == written[p]) continue;  // only touch the hardware on a change
     written[p] = duty[p];
@@ -507,6 +515,15 @@ void update_light() {
 
 void publish_event(const char* text) {
   if (mqtt.connected()) mqtt.publish(t_event, text, false);
+}
+
+// Starts the fade into a new look from what the light shows now: the outputs' duty and the strip's last frame.
+void start_transition() {
+  uint8_t duty[sl::kIoPins];
+  for (int p = 0; p < sl::kIoPins; p++) duty[p] = written[p] < 0 ? 0 : (uint8_t)written[p];
+  const bool strip_showing = strip_com && strip_sent_once && !strip_raw_len && !strip_index_on;
+  sl::transition_start(&transition, millis(), cfg.transition_ms, sl::level_duty(cfg.transition_sparkle), duty,
+                       strip_showing ? strip_last : nullptr, cfg.strip_pixels, micros());
 }
 
 // Applies a command from MQTT or the console. Returns false if it was rejected.
@@ -528,6 +545,7 @@ bool apply_command(const char* text, size_t len, const char* source) {
     publish_event(msg);
     return false;
   }
+  if (memcmp(&next, &light, sizeof light) != 0) start_transition();  // the same look again (a retained resend) doesn't
   light = next;
   strip_raw_len = 0;  // a new light state ends a strip_raw test pattern (strip_index stays until "strip_index off")
   sl::strip_effects_reset(&strip_fx, micros());  // effects start fresh
@@ -816,6 +834,13 @@ void print_status() {
              (unsigned long)strip_frames);
   } else {
     log_line("strip: none");
+  }
+  if (cfg.transition_ms) {
+    char sparkle[8];
+    sl::format_level(cfg.transition_sparkle, sparkle, sizeof sparkle);
+    log_line("transition: %u ms, sparkles %s %%", cfg.transition_ms, sparkle);
+  } else {
+    log_line("transition: off");
   }
   if (mqtt_enabled) {
     IPAddress ip = Ethernet.localIP();

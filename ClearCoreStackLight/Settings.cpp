@@ -2,6 +2,7 @@
 #include "Settings.h"
 
 #include "Strip.h"
+#include "Transition.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -88,6 +89,8 @@ void defaults(Settings* s) {
   strcpy(s->strip_layout, "line");
   for (uint8_t i = 0; i < 3; i++) s->strip_order[i] = i;  // R G B, as the WS2805 datasheet says
   s->timing = {350, 150, 750, 250};
+  s->transition_ms = kTransitionDefaultMs;
+  s->transition_sparkle = kTransitionDefaultSparkle;
   s->allow_reset = false;
 }
 
@@ -257,6 +260,15 @@ bool apply_line(Settings* s, const char* line, char* err, size_t err_cap) {
   if (ms) {
     if (!parse_uint(value, 60000, &u) || u == 0) return fail(err, err_cap, "must be 1..60000 ms", key), false;
     *ms = (uint16_t)u;
+    return true;
+  }
+  if (!strcmp(key, "transition")) {
+    if (!parse_uint(value, kTransitionMaxMs, &u)) return fail(err, err_cap, "must be 0..10000 ms", key), false;
+    s->transition_ms = (uint16_t)u;
+    return true;
+  }
+  if (!strcmp(key, "transition_sparkle")) {
+    if (!parse_level(value, &s->transition_sparkle)) return fail(err, err_cap, "must be a percent 0..100", key), false;
     return true;
   }
   if (!strcmp(key, "allow_reset")) {
